@@ -22,8 +22,12 @@ Windows Update Agent API only.
 - [x] py_compile clean; **59/59 unit tests pass; --self-test 30/30 pass**;
       --scan-only degrades honestly on non-Windows (exit 2, nothing faked)
 - [x] README.md
-- [ ] GitHub: new public repo smartyourtv/windows-health-repair, read-back verified
-- [ ] Google Drive: app zip uploaded, link captured
+- [x] GitHub: new public repo smartyourtv/windows-health-repair — created,
+      8 files uploaded via Contents API, read-back verified (repo public,
+      HTML page confirmed HTTP 200)
+- [x] Google Drive: windows-health-repair-v1.zip uploaded
+      (file ID 1QVYz3oIOzcBFCdLMpw7Cbm1W1gEZ-19e) —
+      https://drive.google.com/file/d/1QVYz3oIOzcBFCdLMpw7Cbm1W1gEZ-19e/view?usp=drivesdk
 
 ## Bugs the tests caught (fixed, regression-covered)
 - SFC/DISM parsers: result sentences that wrap across console lines

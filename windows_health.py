@@ -63,7 +63,18 @@ def now_stamp():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def is_frozen():
+    """True when running as a PyInstaller-built exe (sys.frozen set)."""
+    return bool(getattr(sys, "frozen", False))
+
+
 def app_dir():
+    if is_frozen():
+        # PyInstaller --onefile unpacks __file__ into a temp folder
+        # (_MEIPASS) that is deleted on exit. Logs, backups, reports
+        # and history must live next to the real .exe (the per-user
+        # install folder, which is writable), never in the temp dir.
+        return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
 
 
@@ -2916,8 +2927,12 @@ def launch_gui():
     def relaunch_admin():
         try:
             script = os.path.abspath(__file__)
+            # Frozen exe: sys.executable IS the app, so relaunch it
+            # with no script argument. (Passing the .py path would be
+            # treated as an unknown argument by the exe's argparse.)
+            params = "" if is_frozen() else '"%s"' % script
             rc = ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", sys.executable, '"%s"' % script,
+                None, "runas", sys.executable, params,
                 app_dir(), 1)
             if rc > 32:
                 root.destroy()
@@ -3582,8 +3597,12 @@ def monthly_register():
     """Register the monthly Task Scheduler job (Windows only)."""
     if not IS_WINDOWS:
         return False, "Task Scheduler registration needs Windows."
-    script = os.path.abspath(sys.argv[0])
-    action = '"%s" "%s" --scan-only' % (sys.executable, script)
+    if is_frozen():
+        # Frozen exe: the exe is the program; there is no script arg.
+        action = '"%s" --scan-only' % sys.executable
+    else:
+        script = os.path.abspath(sys.argv[0])
+        action = '"%s" "%s" --scan-only' % (sys.executable, script)
     rc, out = run_cmd(["schtasks", "/Create", "/TN",
                        MONTHLY_TASK_NAME, "/TR", action,
                        "/SC", "MONTHLY", "/D", "1", "/ST", "09:00",

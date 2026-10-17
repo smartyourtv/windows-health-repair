@@ -9,19 +9,39 @@ Most "PC repair" apps are scareware: they invent thousands of registry
 "errors," then offer to "fix all" and break things. This is the honest
 version of that app.
 
-## How to run
+## Install (the easy way)
+
+1. Download **`WindowsHealthRepair-Setup.exe`** from the
+   [latest GitHub Release](https://github.com/smartyourtv/windows-health-repair/releases/latest).
+2. Double-click it. Windows SmartScreen will warn because the app is
+   not code-signed yet — click **More info → Run anyway**. (That
+   warning appears for every unsigned app; it is expected, and the
+   source is right here in this repo if you want to check it.)
+3. Click **Next → Finish**. That's it — **no Python to install**,
+   and no administrator rights are needed to install: the app
+   installs just for your user account and puts a shortcut in the
+   Start Menu (and on the Desktop, unless you untick it).
+4. Launch **Windows Health & Repair** and press **Scan this PC**.
+   Scanning only reads — nothing changes.
+5. Tick the fixes you want and press **Fix checked items**.
+   Fixes need administrator rights; the app offers **Relaunch as admin**.
+6. **Save report** writes the full before/after report next to the app,
+   and **Health certificate** produces a printable one-page summary.
+
+To remove it: **Settings → Apps → Windows Health & Repair → Uninstall.**
+
+No background service, no network calls except the ones below
+(Windows Update driver matching, done by Windows itself).
+
+## Developer fallback (run from Python source)
+
+Only needed if you want to hack on the code — the installer above is
+the normal way to use the app.
 
 1. Install Python 3 from [python.org](https://www.python.org/downloads/windows/)
    (tick **"Add python.exe to PATH"** during setup).
-2. Double-click **`start-windows-health.bat`**.
-3. Press **Scan this PC**. Scanning only reads — nothing changes.
-4. Tick the fixes you want and press **Fix checked items**.
-   Fixes need administrator rights; the app offers **Relaunch as admin**.
-5. **Save report** writes the full before/after report next to the app,
-   and **Health certificate** produces a printable one-page summary.
-
-No installer, no background service, no network calls except the ones
-below (Windows Update driver matching, done by Windows itself).
+2. Double-click **`start-windows-health.bat`** (or run
+   `python windows_health.py`).
 
 ## What the scan checks
 
@@ -172,6 +192,18 @@ a double-click `.bat` launcher. On non-Windows systems every hardware
 scan degrades to an honest "needs Windows" state — results are never
 faked.
 
+## Packaging (reusable template)
+
+The Setup.exe is built from `packaging/` — a PyInstaller single-file
+windowed exe (`packaging/pyinstaller.spec`) wrapped by Inno Setup
+(`packaging/setup.iss`), driven by `packaging/app-config.json` and
+built by the *Build Windows installer* GitHub Actions workflow on
+`windows-latest` (or locally with `packaging/build-installer.ps1`).
+`packaging/TEMPLATE-NOTES.md` documents how the next Windows app
+reuses the same template with only name changes, and
+`python packaging/validate_packaging.py` checks the packaging on any
+OS.
+
 ## Still needs a real Windows PC to verify
 
 Built and unit-tested off-device (parsers, plan safety, certificate
@@ -180,3 +212,8 @@ only real Windows hardware can confirm: live SFC/DISM runs, restore
 point creation, Defender cmdlets on a real install, the WU Agent
 driver search/install round-trip, Task Scheduler registration,
 cache-rebuild Explorer restart behavior, and the GUI end-to-end.
+For the installer specifically: the first CI run on `windows-latest`,
+then a real-PC pass — install as a non-admin user, the SmartScreen
+step above, launch from Start Menu/Desktop, Relaunch-as-admin inside
+the app, the monthly `--scan-only` task firing against the installed
+exe, and uninstall from Settings → Apps.

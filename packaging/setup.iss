@@ -52,7 +52,9 @@ AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 ; Per-user install: lowest privileges, no admin prompt to install.
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=no
+; No privilege overrides: the OverridesAllowed directive is intentionally
+; omitted. Inno Setup 6 accepts only "commandline" and/or "dialog" there;
+; any other value (e.g. "no") fails compilation (caught in CI 2026-10-17).
 DefaultDirName={localappdata}\Programs\{#MyInstallFolder}
 ; Single program, single shortcut set - skip the group-name page so
 ; the wizard stays Next / Install / Finish simple.

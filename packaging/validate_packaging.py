@@ -128,6 +128,16 @@ def main():
         check("setup.iss: %s" % label, token in iss)
     check("setup.iss: values are /D-overridable defines",
           iss.count("#ifndef") >= 7 and iss.count("#define") >= 7)
+    # Inno Setup 6 rejects any OverridesAllowed value other than
+    # "commandline"/"dialog" at compile time (CI failure 2026-10-17);
+    # local validation missed it once, so guard it here.
+    import re as _re
+    _ovr = _re.search(r"(?m)^PrivilegesRequiredOverridesAllowed\s*=\s*(\S.*)$",
+                      iss)
+    check("setup.iss: PrivilegesRequiredOverridesAllowed value is valid",
+          _ovr is None or
+          set(_ovr.group(1).lower().replace(",", " ").split()) <=
+          {"commandline", "dialog"})
 
     # --- PowerShell build script -------------------------------------
     ps1_path = os.path.join(pkg, "build-installer.ps1")

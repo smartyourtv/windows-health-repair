@@ -86,7 +86,21 @@ reusable as a template, not a one-off; see packaging/TEMPLATE-NOTES.md).
       Inno Setup (preinstalled; choco fallback), uploads exe +
       Setup.exe artifacts, attaches both to a Release on v* tags or
       workflow_dispatch with a release_tag input.
-- [ ] First Windows build: trigger the workflow after push; a Setup.exe
+- [x] GitHub push (2026-10-17, Contents API, same route as v1):
+      windows_health.py, README.md, BUILD-STATUS.md updated and all 7
+      packaging/ files created — read-back verified byte-identical,
+      head commits 18911801 (app) / 470a89e1 (template notes).
+- [!] Workflow file push BLOCKED: .github/workflows/build-installer.yml
+      returns HTTP 404 via both Contents and Git Data APIs — the stored
+      GitHub credential lacks the `workflow` scope (same known limit
+      as scout-android-source). The file is ready locally and inside
+      windows-health-repair-easy-install.zip. One manual step unblocks
+      CI: on github.com, Add file → Create new file →
+      .github/workflows/build-installer.yml, paste the zipped copy,
+      commit — then Actions → Build Windows installer → Run workflow.
+      workflow_dispatch could not be triggered before that (workflow
+      must exist on the default branch first).
+- [ ] First Windows build: trigger the workflow after the step above; a Setup.exe
       exists only once that run (or a Windows PC build) completes —
       PyInstaller does not cross-compile from this Linux VM and no exe
       was faked locally. Then the README's Windows-only installer

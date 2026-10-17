@@ -1,0 +1,121 @@
+# Easy-install build (standing rule, 2026-10-17): every Windows app
+# ships as ONE per-user Setup.exe - no Python prerequisite for the user.
+#
+# REUSABLE: this workflow is app-agnostic. Every per-app value is read
+# from packaging/app-config.json in the first step and used via
+# steps.cfg.outputs.* - see packaging/TEMPLATE-NOTES.md.
+#
+# Triggers:
+#   * tag push (v*)      -> build + attach exe & Setup.exe to a Release
+#   * workflow_dispatch  -> build + upload artifacts; if the optional
+#                           release_tag input is given, also publish a
+#                           Release with both files attached.
+
+name: Build Windows installer
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional: also publish a GitHub Release with this tag (e.g. v1.0.0)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read packaging/app-config.json
+        id: cfg
+        shell: pwsh
+        run: |
+          $c = Get-Content packaging/app-config.json -Raw | ConvertFrom-Json
+          "app_name=$($c.app_name)"         >> $env:GITHUB_OUTPUT
+          "display_name=$($c.display_name)" >> $env:GITHUB_OUTPUT
+          "exe_name=$($c.exe_name)"         >> $env:GITHUB_OUTPUT
+          "setup_name=$($c.setup_name)"     >> $env:GITHUB_OUTPUT
+          "source_file=$($c.source_file)"   >> $env:GITHUB_OUTPUT
+          "version=$($c.version)"           >> $env:GITHUB_OUTPUT
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test gate (unit tests + self-test from source)
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests
+          if ($LASTEXITCODE -ne 0) { throw "unit tests failed" }
+          python ${{ steps.cfg.outputs.source_file }} --self-test
+          if ($LASTEXITCODE -ne 0) { throw "self-test failed" }
+
+      - name: Install PyInstaller
+        run: python -m pip install "pyinstaller>=6,<7"
+
+      - name: Build single-file windowed exe
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean packaging/pyinstaller.spec `
+            --distpath dist --workpath build/pyinstaller
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed" }
+
+      - name: Smoke-test the exe (exit codes; windowed exe has no console)
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD ("dist/" + "${{ steps.cfg.outputs.exe_name }}")
+          foreach ($arg in "--version", "--self-test") {
+            $p = Start-Process $exe -ArgumentList $arg -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "exe $arg exited $($p.ExitCode)" }
+          }
+
+      - name: Ensure Inno Setup (preinstalled on windows runners; choco fallback)
+        shell: pwsh
+        run: |
+          $found = (Get-Command ISCC.exe -ErrorAction SilentlyContinue) -or
+                   (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") -or
+                   (Test-Path "$env:ProgramFiles\Inno Setup 6\ISCC.exe")
+          if (-not $found) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed" }
+          }
+
+      - name: Compile the per-user installer
+        shell: pwsh
+        run: |
+          ./packaging/build-installer.ps1 -SkipTests
+          # build-installer.ps1 re-runs PyInstaller (idempotent) so the
+          # exact same path a human runs locally produces the installer.
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.cfg.outputs.app_name }}-windows-installer
+          path: |
+            dist/${{ steps.cfg.outputs.exe_name }}
+            dist/${{ steps.cfg.outputs.setup_name }}
+          if-no-files-found: error
+
+      - name: Attach to Release (tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ steps.cfg.outputs.exe_name }}
+            dist/${{ steps.cfg.outputs.setup_name }}
+
+      - name: Attach to Release (manual dispatch with release_tag)
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: |
+            dist/${{ steps.cfg.outputs.exe_name }}
+            dist/${{ steps.cfg.outputs.setup_name }}

@@ -153,8 +153,15 @@ suggestion on his PC — audited first, then made unmistakable
 - [x] Version 1.1.0 (APP_VERSION + packaging config/version_info).
 - [x] Tests: 96/96 unit (59 baseline preserved + 37 new), self-test
       40/40 (30 + 10 new), packaging validation 42/42.
-- [ ] CI build + release + Drive update — see the release section
-      appended below when done.
+- [x] CI build + release + Drive update (2026-10-17 evening):
+      workflow run 39090368640 SUCCESS (test gate: 96 unit +
+      40 self-test on windows-latest). Release v1.1.0 published:
+      WindowsHealthRepair-Setup.exe 13,455,039 B (SHA-256
+      00ca715f…), WindowsHealthRepair.exe 11,716,773 B. Drive copy
+      updated IN PLACE (file ID 1dyC6B82FdFntVJVbQnFlXj3n9KoVtDe_,
+      so Shawn's existing link now serves v1.1.0) — Drive size
+      13,455,039 B and MD5 225a35a30e9107727ff362d2aa9f1fd7 both
+      match the release asset/local download exactly.
 - [ ] Real-Windows verification still owed (Shawn's PC): Defender
       summary/actions live, Malwarebytes card, troubleshooter
       windows, preventative scan, weekly/monthly task firing.

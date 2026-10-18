@@ -549,5 +549,465 @@ class TestGuiContract(unittest.TestCase):
         self.assertNotIn("resizable(False", src)
 
 
+# ----------------------------------------------------------------------
+# v1.1.0 — security restructure, troubleshooter, preventative scans
+# ----------------------------------------------------------------------
+
+class TestSecurityRestructure(unittest.TestCase):
+    def test_noisy_defender_json_still_read(self):
+        # v1.0.0 lost this to first-run PowerShell progress noise.
+        st = wh.parse_defender_status(
+            wh.extract_json_text(fx.DEFENDER_STATUS_NOISY))
+        self.assertTrue(st["present"])
+        self.assertEqual(st["sig_version"], "1.453.123.0")
+
+    def test_defender_findings_lead_with_summary_and_actions(self):
+        out = wh._defender_findings(fx.DEFENDER_STATUS_NOISY, "")
+        self.assertTrue(out[0].title.startswith(
+            "Windows Security (Microsoft Defender):"))
+        self.assertIn("v1.453.123.0", out[0].title)
+        kinds = [f.fix_kind for f in out if f.fix_kind]
+        # even on a healthy PC the actions are offered (v1.0.0 hid
+        # them — why the Defender tie-in looked absent)
+        self.assertIn("defender_update", kinds)
+        self.assertIn("defender_scan", kinds)
+        targets = [f.payload.get("open_target") for f in out]
+        self.assertIn("ms-windows-security:", targets)
+
+    def test_defender_findings_bad_posture(self):
+        out = wh._defender_findings(fx.DEFENDER_STATUS_BAD_JSON,
+                                    fx.THREATS_JSON)
+        kinds = [f.fix_kind for f in out if f.fix_kind]
+        self.assertIn("defender_rtp_enable", kinds)
+        self.assertEqual(out[0].severity, "bad")
+        self.assertIn("1 threat detection(s)", out[0].title)
+
+    def test_defender_unreadable_is_honest_not_fatal(self):
+        out = wh._defender_findings("", None)
+        self.assertEqual(len(out), 2)
+        self.assertIn("could not be read", out[0].title.lower())
+
+    def test_malwarebytes_card_not_installed(self):
+        f = wh._malwarebytes_finding([])
+        self.assertEqual(f.payload.get("url"),
+                         "https://www.malwarebytes.com/mwb-download/"
+                         "thankyou")
+        self.assertIn("not installed", f.title)
+
+    def test_malwarebytes_launch_found_via_standard_path(self):
+        entry = {"name": "Malwarebytes", "location": "",
+                 "uninstall": ""}
+        exe = wh.find_malwarebytes_exe(
+            entry, exists_fn=lambda p: p.endswith("mbam.exe"))
+        self.assertTrue(exe.endswith("mbam.exe"))
+        self.assertEqual(
+            wh.find_malwarebytes_exe(entry,
+                                     exists_fn=lambda p: False), "")
+
+    def test_malwarebytes_card_installed(self):
+        entries = [{"name": "Malwarebytes",
+                    "location": "C:\\Program Files\\Malwarebytes",
+                    "uninstall": "x"}]
+        f = wh._malwarebytes_finding(entries)
+        self.assertIn("is installed", f.title)
+        self.assertNotIn("url", f.payload)
+
+    def test_exclusion_and_firewall_builders(self):
+        ex = wh._exclusion_findings(True, fx.DEFENDER_EXCLUSIONS_JSON)
+        self.assertEqual(len(ex), 3)
+        self.assertTrue(all(f.fix_kind == "exclusion_remove"
+                            for f in ex))
+        fw = wh._firewall_findings(True, fx.FIREWALL_JSON)
+        off = [f for f in fw if f.fix_kind == "firewall_enable"]
+        self.assertEqual(len(off), 1)
+        self.assertEqual(off[0].payload["profile"], "Public")
+
+
+class TestNewParsers(unittest.TestCase):
+    def test_nslookup(self):
+        self.assertTrue(wh.parse_nslookup(fx.NSLOOKUP_OK)["ok"])
+        self.assertFalse(wh.parse_nslookup(fx.NSLOOKUP_FAIL)["ok"])
+        self.assertFalse(wh.parse_nslookup("")["ok"])
+
+    def test_ping(self):
+        self.assertEqual(wh.parse_ping(fx.PING_OK),
+                         {"sent": 2, "received": 2, "ok": True})
+        self.assertFalse(wh.parse_ping(fx.PING_FAIL)["ok"])
+        self.assertIsNone(wh.parse_ping("total garbage"))
+
+    def test_adapters_and_sound(self):
+        ads = wh.parse_net_adapters(fx.NET_ADAPTERS_JSON)
+        self.assertEqual(ads[0]["status"], "Up")
+        snd = wh.parse_sound_devices(fx.SOUND_DEVICES_JSON)
+        self.assertEqual(snd[0]["status"], "OK")
+
+    def test_smart_predict(self):
+        preds = wh.parse_smart_predict(fx.SMART_PREDICT_JSON)
+        self.assertEqual([p["predict_failure"] for p in preds],
+                         [False, True])
+        self.assertIsNone(wh.parse_smart_predict(""))
+
+    def test_wu_pending_count(self):
+        self.assertEqual(wh.parse_wu_pending_count(fx.WU_PENDING_JSON),
+                         5)
+        self.assertIsNone(wh.parse_wu_pending_count("not json"))
+
+    def test_bugcheck_and_wu_error_codes(self):
+        self.assertEqual(wh.bugcheck_codes(fx.BUGCHECK_EVENTS),
+                         [("0x000000d1", 2)])
+        self.assertEqual(wh.wu_error_codes(fx.WU_FAIL_EVENTS),
+                         [("0x80070422", 1)])
+        self.assertEqual(wh.bugcheck_codes([]), [])
+
+
+class FakeEnv:
+    """Troubleshooter probe double — a healthy PC unless poked."""
+
+    GB = 1024 ** 3
+
+    def __init__(self):
+        self._sfc = {"status": "clean", "message": "clean"}
+        self._dism = {"status": "healthy", "message": "healthy"}
+        self._services = {}
+        self._events = []
+        self._problems = []
+        self._audio = {"services": {
+            "audiosrv": {"status": "Running", "start_type": "Auto",
+                         "display": "Windows Audio"},
+            "audioendpointbuilder": {
+                "status": "Running", "start_type": "Auto",
+                "display": "Audio Endpoint Builder"}},
+            "devices": [{"name": "Speakers", "status": "OK"}],
+            "endpoints": [{"FriendlyName": "Speakers",
+                           "Status": "OK"}],
+            "problem_devices": []}
+        self._defender = {"present": True, "rtp": True,
+                          "sig_age_days": 0}
+        self._wu_search = {"ok": True, "count": 0, "error": None}
+
+    def sfc(self):
+        return self._sfc
+
+    def dism(self):
+        return self._dism
+
+    def services(self, names):
+        return {n.lower(): self._services[n.lower()]
+                for n in names if n.lower() in self._services}
+
+    def events(self, days, provider_like=None):
+        return list(self._events)
+
+    def boot(self):
+        return {"latest_boot": {"total_ms": 30000, "time": "2026"},
+                "offenders": []}
+
+    def startup_items(self):
+        return {"total": 4, "missing": [], "console": []}
+
+    def junk_sizes(self):
+        return {}
+
+    def volumes(self):
+        return [{"DriveLetter": "C", "Size": 500 * self.GB,
+                 "SizeRemaining": 250 * self.GB}]
+
+    def disk_health(self):
+        return [{"FriendlyName": "D0", "HealthStatus": "Healthy"}]
+
+    def smart_predict(self):
+        return [{"instance": "D0", "predict_failure": False}]
+
+    def problem_devices(self):
+        return list(self._problems)
+
+    def memory_diag(self):
+        return {"ran": False, "failed": None}
+
+    def adapters(self):
+        return [{"name": "Wi-Fi", "status": "Up",
+                 "link_speed": "866 Mbps", "desc": ""}]
+
+    def ping_gateway(self):
+        return {"sent": 2, "received": 2, "ok": True}
+
+    def dns_lookup(self):
+        return {"ok": True, "detail": "resolved"}
+
+    def proxy(self):
+        return {"enabled": False, "server": ""}
+
+    def audio(self):
+        return self._audio
+
+    def pending_reboot(self):
+        return []
+
+    def wu_search(self):
+        return self._wu_search
+
+    def defender(self):
+        return self._defender
+
+    def firewall(self):
+        return [{"name": "Public", "enabled": True}]
+
+    def exclusions(self):
+        return []
+
+    def threats(self):
+        return []
+
+
+class TestTroubleshooter(unittest.TestCase):
+    def test_healthy_pc_is_not_found_with_ruled_out_list(self):
+        out = wh.run_troubleshooter("slow_startup", FakeEnv())
+        self.assertEqual(out["outcome"], "not_found")
+        self.assertEqual(len(out["checks"]), 6)
+        self.assertTrue(out["next_steps"])
+        self.assertIsNone(out["cause"])
+
+    def test_dead_startup_entries_are_fixable(self):
+        env = FakeEnv()
+        env.startup_items = lambda: {
+            "total": 5,
+            "missing": [{"name": "Ghost",
+                         "disable": {"mode": "run_value",
+                                     "key": "HKCU\\Run",
+                                     "name": "Ghost"}}],
+            "console": []}
+        out = wh.run_troubleshooter("slow_startup", env)
+        self.assertEqual(out["outcome"], "fixable")
+        self.assertEqual(out["cause"]["id"],
+                         "dead_startup_entries")
+        findings = wh.cause_to_findings(out)
+        self.assertEqual(findings[0].fix_kind, "startup_disable")
+        plan = wh.build_fix_plan(findings)
+        self.assertTrue(wh.plan_is_safe(plan))
+
+    def test_flow_stops_at_first_cause(self):
+        env = FakeEnv()
+        env.smart_predict = lambda: [
+            {"instance": "D0", "predict_failure": True}]
+        out = wh.run_troubleshooter("disk", env)
+        self.assertEqual(out["outcome"], "guided")
+        self.assertEqual(len(out["checks"]), 1)  # SMART is first
+        self.assertTrue(out["cause"]["guide"])
+
+    def test_dns_failure_fixable_and_verifies(self):
+        env = FakeEnv()
+        state = {"ok": False}
+        env.dns_lookup = lambda: {
+            "ok": state["ok"],
+            "detail": "resolved" if state["ok"] else "failed"}
+        out = wh.run_troubleshooter("network", env)
+        self.assertEqual(out["outcome"], "fixable")
+        self.assertEqual(out["cause"]["id"], "dns_failing")
+        passed, _ev = wh.verify_troubleshoot(out, env)
+        self.assertFalse(passed)  # still broken before the fix
+        state["ok"] = True
+        passed, _ev = wh.verify_troubleshoot(out, env)
+        self.assertTrue(passed)
+
+    def test_disabled_update_service_fixable(self):
+        env = FakeEnv()
+        env._services = {"wuauserv": {
+            "status": "Stopped", "start_type": "Disabled",
+            "display": "Windows Update"}}
+        out = wh.run_troubleshooter("update", env)
+        self.assertEqual(out["outcome"], "fixable")
+        fx0 = out["cause"]["fixes"][0]
+        self.assertEqual(fx0["kind"], "service_start")
+        self.assertEqual(fx0["payload"]["name"], "wuauserv")
+
+    def test_sfc_violations_fixable(self):
+        env = FakeEnv()
+        env._sfc = {"status": "violations_unfixed",
+                    "message": "unable to fix some"}
+        out = wh.run_troubleshooter("crashes", env)
+        self.assertEqual(out["outcome"], "fixable")
+        self.assertEqual(out["cause"]["fixes"][0]["kind"],
+                         "sfc_scannow")
+
+    def test_security_rtp_off_fixable(self):
+        env = FakeEnv()
+        env._defender = {"present": True, "rtp": False,
+                         "sig_age_days": 0}
+        out = wh.run_troubleshooter("security", env)
+        self.assertEqual(out["outcome"], "fixable")
+        self.assertEqual(out["cause"]["id"], "rtp_off")
+
+    def test_broken_probe_degrades_to_unknown_not_crash(self):
+        class BoomEnv(FakeEnv):
+            def dism(self):
+                raise RuntimeError("boom")
+
+        out = wh.run_troubleshooter("crashes", BoomEnv())
+        dism = [r for r in out["checks"] if r["id"] == "dism"][0]
+        self.assertEqual(dism["status"], "unknown")
+        self.assertEqual(out["outcome"], "not_found")
+
+    def test_bugcheck_is_guided_with_code(self):
+        env = FakeEnv()
+        env._events = fx.BUGCHECK_EVENTS
+        out = wh.run_troubleshooter("crashes", env)
+        self.assertEqual(out["outcome"], "guided")
+        self.assertIn("0x000000d1", out["checks"][0]["evidence"])
+
+    def test_real_probes_off_windows_degrade_honestly(self):
+        if wh.IS_WINDOWS:
+            self.skipTest("running on Windows")
+        out = wh.run_troubleshooter("slow_startup",
+                                    wh.WindowsProbes(wh.RunLog()))
+        self.assertEqual(out["outcome"], "not_found")
+        self.assertTrue(all(r["status"] in ("pass", "unknown")
+                            for r in out["checks"]))
+
+
+class TestPreventative(unittest.TestCase):
+    GB = 1024 ** 3
+
+    def _data(self, **kw):
+        d = {"collected_at": "2026-10-17T09:00:00",
+             "disks": [{"FriendlyName": "D0",
+                        "HealthStatus": "Healthy"}],
+             "smart": [{"instance": "D0", "predict_failure": False}],
+             "volumes": [{"DriveLetter": "C",
+                          "Size": 500 * self.GB,
+                          "SizeRemaining": 250 * self.GB}],
+             "defender": {"present": True, "rtp": True,
+                          "sig_age_days": 1},
+             "firewall": [{"name": "Public", "enabled": True}],
+             "pending_updates": 0, "startup_names": ["A"],
+             "event_patterns": [], "restore_point_age_days": 3.0}
+        d.update(kw)
+        return d
+
+    def test_healthy_data_no_issues(self):
+        issues, changes = wh.evaluate_preventative(
+            self._data(), self._data())
+        self.assertEqual(issues, [])
+        self.assertEqual(changes, [])
+
+    def test_attention_items_found(self):
+        issues, _ = wh.evaluate_preventative(self._data(
+            smart=[{"instance": "D9", "predict_failure": True}],
+            defender={"present": True, "rtp": False,
+                      "sig_age_days": 20},
+            firewall=[{"name": "Public", "enabled": False}],
+            pending_updates=12))
+        keys = {i["key"] for i in issues}
+        self.assertIn("smart:D9", keys)
+        self.assertIn("defender-rtp", keys)
+        self.assertIn("defender-sig", keys)
+        self.assertIn("firewall:Public", keys)
+        self.assertIn("pending-updates", keys)
+        for i in issues:
+            self.assertIn("area", i)
+
+    def test_changes_vs_previous(self):
+        prev = self._data()
+        cur = self._data(
+            volumes=[{"DriveLetter": "C", "Size": 500 * self.GB,
+                      "SizeRemaining": 100 * self.GB}],
+            startup_names=["A", "NewApp"], pending_updates=3)
+        _issues, changes = wh.evaluate_preventative(cur, prev)
+        joined = " ".join(changes)
+        self.assertIn("free space dropped", joined)
+        self.assertIn("NewApp", joined)
+        self.assertIn("Pending updates: 3 now, was 0", joined)
+
+    def test_first_scan_has_no_change_claims(self):
+        _issues, changes = wh.evaluate_preventative(self._data(),
+                                                    None)
+        self.assertEqual(changes, [])
+
+    def test_event_pattern_thresholds(self):
+        grouped = [
+            {"provider": "disk", "id": 7, "count": 1},
+            {"provider": "Service Control Manager", "id": 7031,
+             "count": 2},
+            {"provider": "Microsoft-Windows-WHEA-Logger", "id": 18,
+             "count": 1},
+        ]
+        pats = wh.select_event_patterns(grouped)
+        keys = {p["key"] for p in pats}
+        self.assertIn("disk", keys)
+        self.assertIn("whea-logger", keys)
+        # 2 service failures is under the >=3 pattern threshold
+        self.assertNotIn("service control manager", keys)
+
+    def test_history_round_trip(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "prev.json")
+        self.assertIsNone(wh.record_preventative(self._data(), path))
+        prev = wh.record_preventative(self._data(), path)
+        self.assertEqual(prev["startup_names"], ["A"])
+        hist = wh.load_preventative_history(path)
+        self.assertEqual(len(hist["scans"]), 2)
+
+    def test_findings_carry_troubleshooter_routing(self):
+        findings, _changes, attention = \
+            wh.build_preventative_findings(
+                self._data(defender={"present": True, "rtp": False,
+                                     "sig_age_days": 1}), None)
+        self.assertEqual(attention, 1)
+        routed = [f for f in findings
+                  if f.payload.get("ts_area") == "security"]
+        self.assertEqual(len(routed), 1)
+        self.assertEqual(routed[0].category, "preventative")
+
+
+class TestScheduleAndNewFixes(unittest.TestCase):
+    def test_mode_default_and_roundtrip(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "mode.json")
+        self.assertEqual(wh.auto_check_mode(path), "monthly")
+        wh.save_auto_check_mode("weekly", path)
+        self.assertEqual(wh.auto_check_mode(path), "weekly")
+        with self.assertRaises(ValueError):
+            wh.save_auto_check_mode("daily", path)
+
+    def test_schtasks_args(self):
+        weekly = wh.auto_check_schtasks_args("weekly", "ACT")
+        self.assertIn("WEEKLY", weekly)
+        self.assertIn("MON", weekly)
+        monthly = wh.auto_check_schtasks_args("monthly", "ACT")
+        self.assertIn("MONTHLY", monthly)
+        self.assertIn(wh.MONTHLY_TASK_NAME, monthly)
+
+    def test_new_fix_kinds_ordered_after_existing(self):
+        self.assertGreater(wh.FIX_ORDER["service_start"],
+                           wh.FIX_ORDER["defender_rtp_enable"])
+        self.assertLess(wh.FIX_ORDER["cleanup_wu_cache"],
+                        wh.FIX_ORDER["wu_reset"])
+        self.assertLess(wh.FIX_ORDER["dns_flush"],
+                        wh.FIX_ORDER["cache_rebuild"])
+
+    def test_service_backup_written(self):
+        import tempfile
+        dest = tempfile.mkdtemp()
+        path = wh.write_service_backup(
+            {"name": "wuauserv", "start_type_before": "Disabled"},
+            dest_dir=dest)
+        with open(path, encoding="utf-8") as fh:
+            rec = json.load(fh)
+        self.assertEqual(rec["start_type_before"], "Disabled")
+
+    def test_wu_backup_name(self):
+        name = wh.wu_cache_backup_name(
+            wh.datetime.datetime(2026, 10, 17, 9, 30, 0))
+        self.assertEqual(name, "Download.bak-20261017-093000")
+
+    def test_new_kinds_need_windows_off_windows(self):
+        if wh.IS_WINDOWS:
+            self.skipTest("running on Windows")
+        for kind in ("dns_flush", "wu_reset", "service_start"):
+            ok, msg = wh.run_fix_step(wh.FixStep(kind, "x"),
+                                      wh.RunLog())
+            self.assertFalse(ok)
+            self.assertIn("needs Windows", msg)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -265,3 +265,55 @@ weekly-or-monthly schedule choice (monthly stays default);
   (minsize set) so the main window layout — and its GUI-contract
   test — is undisturbed. Long flows run on worker threads like the
   main scan.
+
+## Addendum 2026-10-17 (later) — v1.1.1: in-app updater, crash
+## reports, and self-repair of the app's own state
+
+Change-impact (delta over v1.1.0; the full audits above stand —
+this release adds three features and touches no scan, fix,
+security, troubleshooter, or preventative logic):
+
+- *Network surface:* the app's first network calls, exactly two,
+  both to its own GitHub repository's releases on user-visible
+  flows: the update check (launch, throttled to once a day, and
+  the manual button) and the update download itself (only after
+  the user taps Update). Crash reports and repair logs are never
+  uploaded. The module docstring states this honestly.
+- *Updater safety:* a download is verified before it may run —
+  size always, SHA-256 whenever GitHub provides one (the API
+  asset `digest`, verified present on the v1.1.0 release; the
+  code also prefers a `.sha256` checksum asset if one is ever
+  attached). A checksum-asset workflow step was prepared but the
+  contents API cannot write workflow files (no `workflow`
+  scope), so the workflow is unchanged and digest verification
+  carries the hash check — stated plainly, no silent downgrade:
+  when neither hash exists the user is told and offered the
+  release page instead. Failed downloads and downloads that fail
+  verification are deleted, never installed. Never forced,
+  never silent; dismissal is per version and persisted.
+- *Crash capture:* hooks installed at the top of main()
+  (sys.excepthook + threading.excepthook chained to the previous
+  hooks, Tk's report_callback_exception), writing synchronously
+  to Downloads before the app dies, rate-guarded so a crash loop
+  cannot flood the folder. Tk callback errors report but do not
+  kill the app. GUI work stays on Tk's thread via root.after.
+- *Self-repair blast radius:* the four JSON stores (update
+  state, auto-check setting, preventative history, scan history)
+  now load/save through one repairing path. Saves keep the
+  previous good copy as .bak; corrupt loads restore the .bak,
+  salvage valid entries, or quarantine (rename, never delete)
+  plus rebuild from defaults — claimed only after a re-read
+  verifies the store, and logged to the repair log shown in the
+  crash-reports window (repaired / repair-failed). Loaders keep
+  their exact signatures and defaults, so every caller behaves
+  as before on healthy state.
+- *Layout regression risk:* the main window gains one button
+  row's worth of surface (a second bottom row: Check for
+  updates / Crash & error reports / status line) plus a notice
+  bar that is packed only when an update is available. The
+  v1.0.0 GUI-contract test (buttons, text variables, layout
+  order) still passes unchanged; the crash view follows the
+  troubleshooter's Toplevel pattern.
+- *Tests:* 131 unit (96 baseline + 13 updater + 10 crash + 12
+  self-repair), self-test 56 (40 baseline + 16 new), packaging
+  42/42 at version 1.1.1.

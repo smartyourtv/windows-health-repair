@@ -107,6 +107,54 @@ reusable as a template, not a one-off; see packaging/TEMPLATE-NOTES.md).
       verification list (non-admin install, SmartScreen step, admin
       relaunch, monthly task on the exe, uninstall).
 
+## v1.1.1 — in-app updater + crash reports + self-repair (2026-10-17)
+
+Shipped on Shawn's instruction (the standing updater rule,
+2026-10-15 — this was the one app missing it). The crash-report
+and self-repair standing rules (2026-10-17) arrived while v1.1.1
+was still unreleased, so both are folded into this release (not
+a separate v1.1.2):
+
+- **In-app updater:** "Check for updates" button + a launch
+  check throttled to once a day; queries this repo's GitHub
+  releases; ONE subtle notice per version (dismissed = never
+  reshown for that version); Update downloads the new
+  Setup.exe, verifies it (size always; SHA-256 from the GitHub
+  API asset digest — a `.sha256` checksum asset is preferred
+  when one is present), then launches the installer and exits.
+  Never forced, never silent; every failure is plain-language
+  with the release page offered. (A workflow step to attach the
+  checksum file was prepared, but the contents API cannot
+  write workflow files — no `workflow` scope — so the workflow
+  is unchanged and digest verification carries the hash check.)
+- **Crash & error reports:** global capture installed at the
+  top of main() (sys + threading excepthook, Tk callback
+  errors) writes `WindowsHealthRepair-crash-<YYYYMMDD-HHMMSS>.txt`
+  to the user's Downloads folder — plain-language summary,
+  timestamp, app + Windows version, exception + traceback, log
+  tail — synchronously, rate-guarded. In-app "Crash & error
+  reports" viewer (list / read / copy-to-share / open / delete)
+  in the troubleshooter window style. Never auto-uploaded.
+- **Self-repair of the app's own state:** the four JSON stores
+  (update state, auto-check, preventative history, scan
+  history) load/save through one repairing path — saves keep
+  the previous good copy (.bak); corrupt files are restored
+  from it, salvaged entry-by-entry, or quarantined (renamed,
+  never deleted) and rebuilt from defaults; a repair counts
+  only after the store re-reads cleanly, and every attempt is
+  logged (repaired / repair-failed) and shown in the reports
+  window. Startup clears abandoned update downloads and stray
+  temp files; a download that fails verification is deleted
+  and reported, never installed.
+
+Tests: **131 unit + 56 self-test + 42 packaging**, all green
+(unit: 96 baseline + 13 updater + 10 crash + 12 self-repair;
+self-test +16 over the v1.1.0 suite's 40). CI run id and
+release asset size appended after the run, per the v1.1.0
+pattern. Real-Windows behavior (live update check/apply, a
+crash file landing in a real Downloads folder, GUI flows)
+remains **unverified** — no Windows machine here.
+
 ## v1.1.0 — troubleshooter + preventative scans (2026-10-17)
 Per Shawn: the app should systematically troubleshoot an issue until
 it finds the cause, fix it if it safely can, explain step-by-step

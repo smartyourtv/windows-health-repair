@@ -195,6 +195,47 @@ what needs attention" list, and every attention item has a
 **Troubleshoot this** button that opens the matching troubleshooter
 flow.
 
+## App updates (new in v1.1.1)
+
+The app can update itself. **Check for updates** (bottom row of
+buttons) asks this project's GitHub releases whether a newer
+version exists; the app also checks quietly at most once a day
+when it starts, and if a newer version appears it shows **one**
+small notice above the buttons — tap **Not now** and that version
+is never mentioned again. Nothing is ever downloaded or installed
+without you tapping **Update**.
+
+When you do: the new `WindowsHealthRepair-Setup.exe` downloads
+(with progress shown), and is **verified before it runs** — its
+size must match the release, and its SHA-256 must match the hash
+GitHub reports for the file. A download that fails verification is
+deleted, never installed, and the app says what happened and
+offers the release page for a manual download. When the check
+passes, the installer launches and the app closes, so the new
+version replaces this one (same per-user install as always).
+
+## Crash & error reports, and self-repair (new in v1.1.1)
+
+If the app ever hits an unexpected error, it saves a
+plain-language report — **WindowsHealthRepair-crash-<date>-<time>.txt**
+— into your **Downloads** folder: what happened, when, the app
+and Windows versions, the technical details, and the tail of the
+app's own log. **Crash & error reports** (bottom row) lists the
+saved reports so you can read, copy, open, or delete them.
+Reports are **never uploaded anywhere** — they stay on your PC
+until you share one.
+
+The app also looks after its **own** state. If one of its
+settings or history files gets corrupted, it repairs it —
+restored from the last good copy it keeps, or rebuilt from safe
+defaults with whatever data could be salvaged kept and the
+corrupt file set aside (never deleted) — then re-reads the file
+to make sure the repair worked before carrying on. Abandoned
+partial update downloads from an interrupted run are cleared at
+startup. Every repair is noted in the **Crash & error reports**
+window, marked *repaired* — or *repair-failed*, honestly, if it
+couldn't be fixed.
+
 ## Auto-check schedule (opt-in, off by default)
 
 The **Auto-check** button registers a Task Scheduler job that runs

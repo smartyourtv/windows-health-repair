@@ -129,21 +129,82 @@ engines, and kernel drivers. A fake one would create false confidence,
 which is worse than none. Instead, the app audits and drives the
 protection Windows already ships (Defender + firewall + SmartScreen).
 
-**Malwarebytes** is supported as a second-opinion scanner: if it's
-installed, the app offers to launch it. If not, a button opens
-Malwarebytes' official download page. It is **not bundled** —
-Malwarebytes' license forbids redistributing their installer without
-written permission, and a bundled AV copy would go stale immediately
-anyway. Downloads come from them, current version, their terms.
+**Windows Security (Microsoft Defender) — first-class in the app:**
+the Security section of every scan opens with a plain-language
+Defender summary: real-time protection on/off, antivirus signature
+version and age, last quick/full scan times, and threat detections.
+Under it sit working actions, always visible: run a Defender Quick
+Scan, update Defender signatures, and **Open Windows Security**
+(opens Windows' own security app). If Defender cannot be read, the
+app says so and says why — never a silent dead button.
 
-## Monthly auto-check (opt-in, off by default)
+**Malwarebytes** is supported as a second-opinion scanner, and its
+card sits directly under the Defender summary: if Malwarebytes is
+installed, the app offers to launch it; if not, the card explains
+what it is (a respected second-opinion scanner from
+malwarebytes.com) and one button opens the official download page.
+It is **not bundled** — Malwarebytes' license forbids redistributing
+their installer without written permission, and a bundled AV copy
+would go stale immediately anyway. Downloads come from them,
+current version, their terms.
 
-The **Monthly auto-check** button registers a Task Scheduler job that
-runs the app headless (`--scan-only`) on the 1st of each month. It
-**only scans** — headless runs never fix anything. It saves a report
-next to the app and records a small history, so the app can show when
-it last ran and whether findings got better or worse. One click on the
-same button removes the job.
+## Troubleshooter (new in v1.1.0)
+
+Press **Troubleshoot a problem…** and pick what is wrong:
+
+- **PC is slow / startup trouble**
+- **Crashes & freezes (blue screens)**
+- **Internet / network not working**
+- **No sound / sound problems**
+- **Windows Update keeps failing**
+- **Disk / storage trouble**
+- **Security concerns**
+
+The app runs real checks in order (cheap ones first), showing the
+evidence as it goes, and ends in exactly one honest outcome:
+
+1. **Cause found and safely fixable** → the fix is offered behind the
+   usual rules: restore point first (hard gate), per-change backup,
+   then the failing check is re-run to **verify** the result and
+   report pass/fail truthfully.
+2. **Cause found but bigger than a safe automatic fix** → a
+   step-by-step guide screen, tailored to the found cause (numbered,
+   plain language, copyable for printing).
+3. **Cause not found** → the app says so, lists everything it checked
+   and ruled out, and gives the next manual steps. It never invents
+   a cause.
+
+The safe-fix set grew conservatively: a Windows Update cache reset
+(the old cache folder is renamed aside as a backup, never deleted),
+a DNS flush (with a verification lookup afterwards), re-enabling a
+stopped/disabled Windows service (its previous state is saved to
+`backups/` first), plus the existing network-stack reset (clearly
+labelled, off by default) and icon/thumbnail cache rebuild.
+
+## Preventative scans (new in v1.1.0)
+
+Press **Preventative scan**, or let the scheduled auto-check run it:
+disk health (SMART failure prediction via WMI, not just the status
+flag), free-space level and how it changed since the last scan,
+Defender state and signature age, firewall state, pending Windows
+Update count, startup-item changes, error-log patterns worth
+watching (disk errors, WHEA hardware errors, repeated service
+failures), and the age of the newest restore point. Results are
+stored as history, reported as a plain-language "what changed /
+what needs attention" list, and every attention item has a
+**Troubleshoot this** button that opens the matching troubleshooter
+flow.
+
+## Auto-check schedule (opt-in, off by default)
+
+The **Auto-check** button registers a Task Scheduler job that runs
+the app headless (`--scan-only`). It **only scans** — headless runs
+never fix anything. Use the **Auto-check: Monthly / Weekly** button
+to choose: monthly (the default, 1st of each month) or weekly
+(Mondays). It saves a report next to the app — including the
+preventative "what changed" section — and records a small history,
+so the app can show when it last ran and whether findings got better
+or worse. One click on the same button removes the job.
 
 ## PC Health Certificate
 
@@ -176,7 +237,7 @@ invented.
   from third-party sites, no silent uninstalls, no forced reboots.
 - No homemade antivirus, no quarantining/deleting on its own.
 - No telemetry, no accounts, no background service (unless you opt
-  into the monthly scan-only check).
+  into the weekly/monthly scan-only auto-check).
 
 ## Headless / developer use
 
@@ -207,13 +268,17 @@ OS.
 ## Still needs a real Windows PC to verify
 
 Built and unit-tested off-device (parsers, plan safety, certificate
-rubric, monthly diff — all against recorded fixtures). The following
-only real Windows hardware can confirm: live SFC/DISM runs, restore
-point creation, Defender cmdlets on a real install, the WU Agent
-driver search/install round-trip, Task Scheduler registration,
-cache-rebuild Explorer restart behavior, and the GUI end-to-end.
-For the installer specifically: the first CI run on `windows-latest`,
-then a real-PC pass — install as a non-admin user, the SmartScreen
-step above, launch from Start Menu/Desktop, Relaunch-as-admin inside
-the app, the monthly `--scan-only` task firing against the installed
-exe, and uninstall from Settings → Apps.
+rubric, monthly diff — all against recorded fixtures). The
+v1.1.0 machinery (troubleshooter flows, preventative evaluation,
+security restructure) is unit-tested with mocked probes the same
+way. The following only real Windows hardware can confirm: live
+SFC/DISM runs, restore point creation, Defender cmdlets on a real
+install, the WU Agent driver search/install round-trip, Task
+Scheduler registration, cache-rebuild Explorer restart behavior,
+the new troubleshooter/preventative GUI windows end-to-end, and the
+GUI generally. For the installer specifically: the first CI run on
+`windows-latest`, then a real-PC pass — install as a non-admin user,
+the SmartScreen step above, launch from Start Menu/Desktop,
+Relaunch-as-admin inside the app, the scheduled `--scan-only` task
+firing against the installed exe, and uninstall from
+Settings → Apps.

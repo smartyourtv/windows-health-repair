@@ -107,6 +107,58 @@ reusable as a template, not a one-off; see packaging/TEMPLATE-NOTES.md).
       verification list (non-admin install, SmartScreen step, admin
       relaunch, monthly task on the exe, uninstall).
 
+## v1.1.0 — troubleshooter + preventative scans (2026-10-17)
+Per Shawn: the app should systematically troubleshoot an issue until
+it finds the cause, fix it if it safely can, explain step-by-step
+when it can't, and run preventative scans. Plus his v1.0.0 report
+that he could NOT see the Defender tie-in or the Malwarebytes
+suggestion on his PC — audited first, then made unmistakable
+(full findings in docs/AUDITS.md, v1.1.0 sections A/B/C).
+
+- [x] Security restructure: the scan's Security section now leads
+      with a one-line plain-language Defender summary (RTP, signature
+      VERSION + age, last scans, threat count); signature update is
+      ALWAYS offered (was: only when signatures were >2 days old —
+      why a healthy PC showed almost nothing); a new "Open Windows
+      Security" action; the Malwarebytes card sits directly under
+      the summary (installed → launch via a broader search incl.
+      standard install paths; absent → suggestion + official-page
+      button). Each sub-part is isolated: a failure in one no longer
+      collapses the whole section into one vague row, and PowerShell
+      output noise can no longer break the Defender JSON parse.
+- [x] Troubleshooter: 7 problem areas (slow/startup, crashes &
+      freezes, network, sound, Windows Update, disk/storage,
+      security) driven by 33 ordered real checks (cheap → deep) over
+      probe methods that never invent results. Exactly three honest
+      outcomes: fixable (restores behind the existing hard gate,
+      then VERIFIED by re-running the failing check), guided
+      (step-by-step guide screen, copyable), not-found (what was
+      ruled out + next manual steps). GUI window runs checks on a
+      worker thread with live evidence.
+- [x] New safe fixes: wu_reset (WU cache rename-aside backup, never
+      deleted), dns_flush (verified by a follow-up lookup),
+      service_start (pre-state saved to backups/ first). Existing
+      3-class registry rules and net_reset (warning, opt-in only)
+      untouched.
+- [x] Preventative scans: SMART PredictFailure (WMI), free-space
+      level + change, Defender state/signature age, firewall,
+      pending-update count, startup-item additions, event-log
+      patterns (disk/WHEA/service failures with thresholds), newest
+      restore-point age. History in preventative-history.json
+      (last 24); "what changed / what needs attention" in the GUI and
+      in the headless --scan-only report; every attention item
+      routes into the troubleshooter ("Troubleshoot this").
+- [x] Auto-check frequency: user picks Weekly or Monthly (monthly
+      default; same task name, re-registered when changed while on).
+- [x] Version 1.1.0 (APP_VERSION + packaging config/version_info).
+- [x] Tests: 96/96 unit (59 baseline preserved + 37 new), self-test
+      40/40 (30 + 10 new), packaging validation 42/42.
+- [ ] CI build + release + Drive update — see the release section
+      appended below when done.
+- [ ] Real-Windows verification still owed (Shawn's PC): Defender
+      summary/actions live, Malwarebytes card, troubleshooter
+      windows, preventative scan, weekly/monthly task firing.
+
 ## Notes
 - Sandbox is Linux: all Windows execution paths degrade to honest
   NEEDS-WINDOWS states; parsers/logic are what get tested here.

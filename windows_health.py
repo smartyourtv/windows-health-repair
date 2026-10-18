@@ -13,7 +13,20 @@ What this app deliberately does NOT do (no scareware, no snake oil):
     App Paths entries whose .exe is gone, Uninstall entries whose install
     folder is gone, and startup Run entries whose target file is gone.
   * No inflated "error" counts, no RAM "boosters", no driver downloads,
-    no background "optimization" services, no network calls at all.
+    no background "optimization" services. The ONLY network calls the
+    app itself ever makes are the update check against this app's own
+    GitHub releases (user-tapped, plus a throttled once-a-day look at
+    launch) and the update download itself — always verified before
+    it runs, never silent, never forced. Nothing else phones home.
+  * Crash reports are never uploaded either: on an unexpected error
+    the app saves a plain-language report to your Downloads folder
+    (and lists it under "Crash & error reports") — it leaves this
+    PC only if you choose to share it.
+  * If the app's OWN settings or history files get corrupted, it
+    repairs them — restored from the last good copy it keeps, or
+    rebuilt from safe defaults with the salvageable data kept and
+    the corrupt file set aside, never deleted — verifies the
+    repair, and notes it under "Crash & error reports".
 
 Run `python windows_health.py --self-test` for a headless check of the
 parsing/logic layer. On non-Windows systems every hardware scan degrades
@@ -23,15 +36,20 @@ to an honest "needs Windows" state — results are never faked.
 import argparse
 import ctypes
 import datetime
+import hashlib
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
 import threading
+import traceback
+import urllib.error
+import urllib.request
 
 APP_NAME = "Windows Health & Repair"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 IS_WINDOWS = sys.platform.startswith("win")
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
@@ -79,10 +97,18 @@ def app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+# The most recently created RunLog — the crash reporter reads its
+# tail, so crash reports reuse the app's existing logging instead
+# of a parallel system.
+_ACTIVE_LOG = None
+
+
 class RunLog:
     """Timestamped log: in-memory lines + optional file + optional GUI sink."""
 
     def __init__(self, sink=None):
+        global _ACTIVE_LOG
+        _ACTIVE_LOG = self
         self.lines = []
         self.sink = sink
         self.path = None
@@ -3147,6 +3173,145 @@ def run_self_test():
     check("auto-check schedule args",
           "WEEKLY" in auto_check_schtasks_args("weekly", "x")
           and "MONTHLY" in auto_check_schtasks_args("monthly", "x"))
+    # --- v1.1.1: in-app updater -----------------------------------
+    import tempfile as _tempfile
+    _tmp = _tempfile.mkdtemp()
+    _spath = os.path.join(_tmp, "update-state.json")
+    check("version parse",
+          parse_version("v1.2.3") == (1, 2, 3)
+          and parse_version("1.2") == (1, 2)
+          and parse_version("soon") is None)
+    check("version compare",
+          is_newer_version("1.1.1", "1.1.0")
+          and not is_newer_version("1.1.0", "1.1.0")
+          and not is_newer_version("1.0.9", "1.1.0"))
+    _rel = parse_release({
+        "tag_name": "v9.9.9", "html_url": "https://example.invalid/r",
+        "assets": [
+            {"name": UPDATE_SETUP_NAME, "size": 123,
+             "browser_download_url": "https://example.invalid/s",
+             "digest": "sha256:" + "a" * 64},
+            {"name": UPDATE_CHECKSUM_NAME,
+             "browser_download_url": "https://example.invalid/c"}]})
+    check("release parse",
+          _rel["version"] == "9.9.9"
+          and _rel["setup"]["size"] == 123
+          and _rel["setup"]["sha256"] == "a" * 64
+          and _rel["checksum_url"].endswith("/c"))
+    _ust = dismiss_update_notice({}, "9.9.9", path=_spath)
+    check("update notice once per version",
+          update_notice_wanted({}, "9.9.9")
+          and not update_notice_wanted(_ust, "9.9.9")
+          and update_notice_wanted(_ust, "9.9.10")
+          and not update_notice_wanted(_ust, APP_VERSION))
+    check("update check throttle",
+          update_check_due({})
+          and not update_check_due(
+              record_update_check({}, path=_spath))
+          and update_check_due({"last_check": "2000-01-01T00:00:00"}))
+    _blob = b"setup-bytes" * 100
+    _vhash = hashlib.sha256(_blob).hexdigest()
+
+    class _FakeResp:
+        def __init__(self, data):
+            self._buf = data
+
+        def read(self, n=-1):
+            if n is None or n < 0:
+                out, self._buf = self._buf, b""
+                return out
+            out, self._buf = self._buf[:n], self._buf[n:]
+            return out
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    _dl, _derr = download_update(
+        {"setup": {"url": "https://example.invalid/s",
+                   "size": len(_blob)}},
+        dest_dir=_tmp,
+        opener=lambda req, timeout=None: _FakeResp(_blob))
+    check("update download via opener",
+          _derr is None and _dl is not None
+          and verify_download(_dl, len(_blob), _vhash)[0])
+    check("download verify rejects wrong size and hash",
+          not verify_download(_dl, len(_blob) + 1, _vhash)[0]
+          and not verify_download(_dl, len(_blob), "0" * 64)[0]
+          and verify_download(_dl, len(_blob))[0])
+    check("checksum text parse",
+          parse_checksum_text(_vhash + "  " + UPDATE_SETUP_NAME)
+          == _vhash and parse_checksum_text("nope") is None)
+    # --- v1.1.1: crash & error reports -----------------------------
+    try:
+        raise ValueError("self-test boom")
+    except ValueError:
+        _etype, _eval, _etb = sys.exc_info()
+    _clog = RunLog()
+    _clog("self-test log line")
+    _cpath = write_crash_report(_etype, _eval, _etb, dirs=[_tmp],
+                                 log=_clog)
+    _ctext = read_crash_report(_cpath) if _cpath else ""
+    check("crash report written to a file",
+          bool(_cpath)
+          and _CRASH_NAME_RE.match(os.path.basename(_cpath))
+          and "ran into an unexpected problem" in _ctext
+          and "ValueError: self-test boom" in _ctext
+          and APP_VERSION in _ctext
+          and "Traceback" in _ctext
+          and "self-test log line" in _ctext)
+    check("crash report listed, then deleted",
+          any(r["path"] == _cpath
+              for r in list_crash_reports(dirs=[_tmp]))
+          and delete_crash_report(_cpath)
+          and not any(r["path"] == _cpath
+                      for r in list_crash_reports(dirs=[_tmp])))
+    check("crash report name + log tail",
+          crash_report_name(datetime.datetime(2026, 10, 17, 9, 5, 3))
+          == "WindowsHealthRepair-crash-20261017-090503.txt"
+          and log_tail(["l%d" % i for i in range(10)], 3)
+          == ["l7", "l8", "l9"])
+    check("delete refuses files that are not crash reports",
+          not delete_crash_report(os.path.join(_tmp,
+                                               "important.txt")))
+    # --- v1.1.1: self-repair of the app's own state -----------------
+    _rdir = os.path.join(_tmp, "repair")
+    os.makedirs(_rdir, exist_ok=True)
+    _rp1 = os.path.join(_rdir, "store.json")
+    with open(_rp1, "w", encoding="utf-8") as _fh:
+        _fh.write("{corrupt")
+    _write_json_file(_rp1 + ".bak", {"mode": "weekly"})
+    _rd1 = load_json_store(_rp1, _salvage_auto_check,
+                           lambda: {"mode": "monthly"},
+                           "self-test store")
+    check("self-repair restores the last good copy",
+          _rd1 == {"mode": "weekly"}
+          and _read_json_file(_rp1)[0] == {"mode": "weekly"})
+    _rp2 = os.path.join(_rdir, "store2.json")
+    with open(_rp2, "w", encoding="utf-8") as _fh:
+        _fh.write("not json at all")
+    _rd2 = load_json_store(_rp2, _salvage_auto_check,
+                           lambda: {"mode": "monthly"},
+                           "self-test store 2")
+    _quar = [n for n in os.listdir(_rdir)
+             if n.startswith("store2.json.corrupt-")]
+    check("self-repair rebuilds defaults, keeps the corrupt copy",
+          _rd2 == {"mode": "monthly"} and len(_quar) == 1)
+    _udir = os.path.join(_rdir, UPDATE_DIR_NAME)
+    os.makedirs(_udir, exist_ok=True)
+    with open(os.path.join(_udir, "leftover.exe"), "wb") as _fh:
+        _fh.write(b"partial")
+    _cleared = cleanup_stale_state(base=_rdir)
+    check("startup cleanup clears abandoned downloads",
+          any("leftover" in c for c in _cleared)
+          and not os.listdir(_udir)
+          and cleanup_stale_state(base=_rdir) == [])
+    check("repair events are logged as repaired",
+          any(e.get("result") == "repaired"
+              for e in load_repair_events(
+                  path=os.path.join(_rdir, REPAIR_EVENTS_FILE))))
 
     print("%s %s — self-test" % (APP_NAME, APP_VERSION))
     print("Platform: %s | Windows: %s | Admin: %s | Python: %s"
@@ -3181,6 +3346,34 @@ def launch_gui():
     import webbrowser
 
     root = tk.Tk()
+
+    def _tk_exception(exc_type, exc_value, tb):
+        # Tk callback errors don't reach sys.excepthook — route
+        # them into the same crash capture, tell the user plainly,
+        # and keep the app alive.
+        path = handle_unhandled_exception(exc_type, exc_value, tb)
+        try:
+            traceback.print_exception(exc_type, exc_value, tb)
+        except Exception:
+            pass
+        log("Interface error: %s: %s (crash report: %s)"
+            % (getattr(exc_type, "__name__", exc_type), exc_value,
+               path or "could not be saved"))
+        if path:
+            messagebox.showerror(
+                "Something went wrong",
+                "The app hit an unexpected problem, but it's still "
+                "running.\n\nA crash report was saved to your "
+                "Downloads folder:\n%s\n\nReports are never sent "
+                "anywhere — you can read it under 'Crash & error "
+                "reports'." % path)
+        else:
+            messagebox.showerror(
+                "Something went wrong",
+                "The app hit an unexpected problem, but it's still "
+                "running. A crash report could not be saved this "
+                "time.")
+    root.report_callback_exception = _tk_exception
     root.title("%s — v%s" % (APP_NAME, APP_VERSION))
     root.geometry("1020x720")
     root.minsize(900, 600)
@@ -3194,6 +3387,7 @@ def launch_gui():
         "findings": [], "checked": set(), "rows": {},
         "busy": False, "cancel": threading.Event(),
         "fix_results": None,
+        "update_info": None, "upd_busy": False,
     }
     log_queue = queue_mod.Queue()
     log = RunLog(sink=lambda line: log_queue.put(line))
@@ -3210,6 +3404,18 @@ def launch_gui():
     note_lbl = tk.Label(root, textvariable=note_var, bg=bg, fg="#f2c14e",
                         font=("Sans", 10), wraplength=960, justify="left")
     note_lbl.pack(fill="x", padx=16)
+
+    # Update notice (v1.1.1): built now, packed on demand only when
+    # an update is actually available — one subtle bar, dismissed
+    # once per version, never a popup storm.
+    upd_frame = tk.Frame(root, bg=bg)
+    upd_var = tk.StringVar()
+    tk.Label(upd_frame, textvariable=upd_var, bg=bg, fg=accent,
+             font=("Sans", 10, "bold")).pack(side="left")
+    upd_go_btn = tk.Button(upd_frame, text="Update", padx=12, pady=2)
+    upd_go_btn.pack(side="left", padx=8)
+    upd_no_btn = tk.Button(upd_frame, text="Not now", padx=10, pady=2)
+    upd_no_btn.pack(side="left")
 
     btns = tk.Frame(root, bg=bg)
     btns.pack(fill="x", padx=16, pady=6)
@@ -3255,6 +3461,21 @@ def launch_gui():
                           "safely or explains how.",
              bg=bg, fg="#9aa3b2", font=("Sans", 9)).pack(side="left",
                                                          padx=6)
+
+    btns4 = tk.Frame(root, bg=bg)
+    btns4.pack(fill="x", padx=16, pady=(0, 2))
+    upd_check_btn = tk.Button(btns4, text="Check for updates",
+                              padx=12, pady=4)
+    upd_check_btn.pack(side="left")
+    crash_btn = tk.Button(btns4, text="Crash & error reports",
+                          padx=12, pady=4)
+    crash_btn.pack(side="left", padx=8)
+    upd_status_var = tk.StringVar(
+        value="Version %s. Updates come from this app's GitHub "
+              "releases and install only when you tap Update."
+              % APP_VERSION)
+    tk.Label(btns4, textvariable=upd_status_var, bg=bg, fg="#9aa3b2",
+             font=("Sans", 9)).pack(side="left", padx=10)
 
     progress = ttk.Progressbar(root, mode="determinate")
     progress.pack(fill="x", padx=16, pady=(2, 2))
@@ -3880,6 +4101,344 @@ def launch_gui():
         if preselect:
             do_run()
 
+    # ---- in-app updates (v1.1.1) --------------------------------
+    def show_update_notice(info):
+        state["update_info"] = info
+        upd_var.set("Update available: %s v%s — you have v%s."
+                    % (APP_NAME, info["version"], APP_VERSION))
+        upd_frame.pack(fill="x", padx=16, pady=(0, 2), before=btns)
+
+    def hide_update_notice():
+        upd_frame.pack_forget()
+
+    def do_dismiss_update():
+        info = state.get("update_info")
+        if info:
+            dismiss_update_notice(load_update_state(),
+                                  info["version"])
+        hide_update_notice()
+        upd_status_var.set("Okay — version %s won't be announced "
+                           "again. 'Check for updates' still works "
+                           "any time." % (info or {}).get(
+                               "version", ""))
+
+    def do_check_updates():
+        """Manual check: always reports the outcome, and shows the
+        notice whenever a newer version exists (a manual check is
+        the user asking, so an earlier dismissal doesn't hide it).
+        """
+        if state["upd_busy"]:
+            return
+        state["upd_busy"] = True
+        upd_check_btn.configure(state="disabled")
+        upd_status_var.set("Checking GitHub for updates…")
+
+        def worker():
+            info, err = fetch_latest_release()
+            if info:
+                record_update_check(load_update_state(),
+                                    info["version"])
+
+            def done():
+                state["upd_busy"] = False
+                upd_check_btn.configure(state="normal")
+                if err:
+                    upd_status_var.set("The update check failed.")
+                    messagebox.showerror(
+                        "Check for updates",
+                        "The update check could not be completed.\n"
+                        "\n%s\n\nNothing was changed. You can "
+                        "download the latest version yourself "
+                        "from:\n%s" % (err, UPDATE_RELEASES_PAGE))
+                    return
+                if is_newer_version(info["version"]):
+                    show_update_notice(info)
+                    upd_status_var.set(
+                        "Version %s is available — press Update in "
+                        "the notice above when you're ready."
+                        % info["version"])
+                else:
+                    hide_update_notice()
+                    upd_status_var.set("You have the latest version "
+                                       "(v%s)." % APP_VERSION)
+                    messagebox.showinfo(
+                        "Check for updates",
+                        "You're up to date — this PC already runs "
+                        "the latest version (v%s)." % APP_VERSION)
+            root.after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def auto_update_check():
+        """Throttled launch check: silent unless a version the
+        user hasn't dismissed is available (one notice per
+        version). The attempt is recorded either way, so a dead
+        network isn't retried on every launch."""
+        if not update_check_due(load_update_state()):
+            return
+
+        def worker():
+            info, err = fetch_latest_release()
+            st = record_update_check(
+                load_update_state(),
+                info["version"] if info else None)
+            if err:
+                log("Automatic update check failed: %s" % err)
+                return
+            if info and update_notice_wanted(st, info["version"]):
+                root.after(0, lambda: show_update_notice(info))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def do_apply_update():
+        info = state.get("update_info")
+        if not info or state["upd_busy"]:
+            return
+        state["upd_busy"] = True
+        upd_go_btn.configure(state="disabled")
+        upd_check_btn.configure(state="disabled")
+        set_busy(True, "Downloading the update…")
+        last = {"mb": -1}
+
+        def progress(done, total):
+            mb = done // (512 * 1024)
+            if mb == last["mb"] and done != total:
+                return
+            last["mb"] = mb
+
+            def ui():
+                status_var.set("Downloading the update… %s of %s"
+                               % (human_size(done),
+                                  human_size(total or done)))
+            root.after(0, ui)
+
+        def worker():
+            dest, err = download_update(info, progress=progress)
+            if not err:
+                sha = fetch_expected_sha256(info)
+                ok, msg = verify_download(
+                    dest, (info.get("setup") or {}).get("size"), sha)
+                if ok:
+                    log("Update download check: %s" % msg)
+                else:
+                    err = msg
+                    if discard_download(dest):
+                        record_repair_event(
+                            "update download", "repaired",
+                            "a download that failed verification "
+                            "was deleted, so it can never be "
+                            "installed (%s)" % msg)
+                    else:
+                        record_repair_event(
+                            "update download", "repair-failed",
+                            "a download that failed verification "
+                            "could not be deleted: %s" % dest)
+
+            def done():
+                state["upd_busy"] = False
+                upd_go_btn.configure(state="normal")
+                upd_check_btn.configure(state="normal")
+                set_busy(False)
+                if err:
+                    status_var.set("The update did not complete.")
+                    if messagebox.askyesno(
+                            "Update failed",
+                            "The update could not be installed.\n\n"
+                            "%s\n\nNothing was changed. Open the "
+                            "download page in your browser instead?"
+                            % err):
+                        webbrowser.open(info.get("page")
+                                        or UPDATE_RELEASES_PAGE)
+                    return
+                status_var.set("Starting the installer — this app "
+                               "will close so the new version can "
+                               "replace it.")
+                root.update_idletasks()
+                try:
+                    launch_update_installer(dest)
+                except OSError as exc:
+                    messagebox.showerror(
+                        "Update failed",
+                        "The installer could not be started (%s). "
+                        "You can run it yourself from:\n%s"
+                        % (exc, dest))
+                    return
+                root.destroy()
+            root.after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---- crash & error reports (v1.1.1) --------------------------
+    def open_crash_reports():
+        win = tk.Toplevel(root)
+        win.title("Crash & error reports — %s" % APP_NAME)
+        win.geometry("880x640")
+        win.minsize(760, 520)
+        win.resizable(True, True)
+        win.configure(bg=bg)
+        tk.Label(win, text="Crash & error reports", bg=bg, fg=fg,
+                 font=("Sans", 13, "bold")).pack(fill="x", padx=14,
+                                                  pady=(10, 2))
+        tk.Label(win, bg=bg, fg="#9aa3b2", font=("Sans", 9),
+                 wraplength=840, justify="left",
+                 text="When the app runs into an unexpected "
+                      "problem, it saves a plain-language report "
+                      "here and as a file in your Downloads "
+                      "folder. Reports are never sent anywhere — "
+                      "they stay on this PC until you share or "
+                      "delete them."
+                 ).pack(fill="x", padx=14)
+        rep_events = load_repair_events()
+        if rep_events:
+            rep_lines = ["Recent self-repairs (the app fixing its "
+                         "own state):"]
+            for e in rep_events[-3:]:
+                rep_lines.append(
+                    "• %s — %s (%s)%s"
+                    % ((e.get("when") or "")[:16].replace("T", " "),
+                       e.get("what") or "", e.get("result") or "",
+                       (" — " + e["detail"]) if e.get("detail")
+                       else ""))
+            tk.Label(win, bg=bg, fg="#9aa3b2", font=("Sans", 9),
+                     wraplength=840, justify="left",
+                     text="\n".join(rep_lines)).pack(fill="x",
+                                                      padx=14)
+        lst = tk.Listbox(win, bg="#0b0d12", fg="#cfd6e4",
+                         font=("Monospace", 9), height=8)
+        lst.pack(fill="x", padx=14, pady=6)
+        out_box = scrolledtext.ScrolledText(
+            win, bg="#0b0d12", fg="#cfd6e4", font=("Monospace", 9),
+            state="disabled")
+        out_box.pack(fill="both", expand=True, padx=14, pady=(0, 6))
+        act = tk.Frame(win, bg=bg)
+        act.pack(fill="x", padx=14, pady=(0, 10))
+        cr_status = tk.StringVar()
+        tk.Label(act, textvariable=cr_status, bg=bg, fg="#9aa3b2",
+                 font=("Sans", 9)).pack(side="right")
+        items = {"reports": []}
+
+        def show(text):
+            out_box.configure(state="normal")
+            out_box.delete("1.0", "end")
+            out_box.insert("1.0", text)
+            out_box.configure(state="disabled")
+
+        def refresh():
+            items["reports"] = list_crash_reports()
+            lst.delete(0, "end")
+            for r in items["reports"]:
+                when = datetime.datetime.fromtimestamp(
+                    r["mtime"]).strftime("%Y-%m-%d %H:%M")
+                lst.insert("end", "%s — %s (%s)"
+                           % (r["name"], when,
+                              human_size(r["size"])))
+            if items["reports"]:
+                cr_status.set("%d report(s) saved."
+                              % len(items["reports"]))
+            else:
+                cr_status.set("No reports saved.")
+                show("No crash reports saved. If the app ever runs "
+                     "into a problem, its report will appear here "
+                     "(and in your Downloads folder).")
+
+        def selected():
+            sel = lst.curselection()
+            if not sel:
+                messagebox.showinfo(
+                    "Nothing selected",
+                    "Pick a report in the list first.", parent=win)
+                return None
+            return items["reports"][sel[0]]
+
+        def do_view():
+            r = selected()
+            if not r:
+                return
+            try:
+                show(read_crash_report(r["path"]))
+            except OSError as exc:
+                messagebox.showerror(
+                    "Could not read it",
+                    "The report could not be read: %s" % exc,
+                    parent=win)
+
+        def do_open_file():
+            r = selected()
+            if not r:
+                return
+            if IS_WINDOWS:
+                os.startfile(r["path"])  # noqa: S606 - our file
+            else:
+                messagebox.showinfo(
+                    "Report file",
+                    "On Windows this opens the report. It lives "
+                    "at:\n%s" % r["path"], parent=win)
+
+        def do_copy():
+            r = selected()
+            if not r:
+                return
+            try:
+                text = read_crash_report(r["path"])
+            except OSError as exc:
+                messagebox.showerror(
+                    "Could not read it",
+                    "The report could not be read: %s" % exc,
+                    parent=win)
+                return
+            win.clipboard_clear()
+            win.clipboard_append(text)
+            cr_status.set("Report copied — paste it into an email "
+                          "or message to share it.")
+
+        def do_open_folder():
+            folder = downloads_dir()
+            if IS_WINDOWS:
+                os.startfile(folder)  # noqa: S606 - our folder
+            else:
+                messagebox.showinfo(
+                    "Downloads folder",
+                    "Reports are saved in:\n%s" % folder,
+                    parent=win)
+
+        def do_view_soft():
+            sel = lst.curselection()
+            if not sel:
+                return
+            r = items["reports"][sel[0]]
+            try:
+                show(read_crash_report(r["path"]))
+            except OSError:
+                pass
+
+        def do_delete():
+            r = selected()
+            if not r:
+                return
+            if not messagebox.askyesno(
+                    "Delete report",
+                    "Delete %s?\nThis cannot be undone."
+                    % r["name"], parent=win):
+                return
+            if delete_crash_report(r["path"]):
+                refresh()
+                show("Report deleted.")
+            else:
+                messagebox.showerror(
+                    "Delete failed",
+                    "The report could not be deleted.",
+                    parent=win)
+
+        for text, cmd in (("View", do_view),
+                          ("Open file", do_open_file),
+                          ("Copy (to share)", do_copy),
+                          ("Open Downloads folder", do_open_folder),
+                          ("Delete", do_delete),
+                          ("Refresh", refresh)):
+            tk.Button(act, text=text, command=cmd, padx=10,
+                      pady=4).pack(side="left", padx=(0, 6))
+        lst.bind("<<ListboxSelect>>", lambda e: do_view_soft())
+        refresh()
+
     scan_btn.configure(command=do_scan)
     fix_btn.configure(command=do_fix)
     cancel_btn.configure(command=lambda: state["cancel"].set())
@@ -3890,6 +4449,10 @@ def launch_gui():
     mode_btn.configure(command=do_mode)
     ts_btn.configure(command=lambda: open_troubleshooter())
     prev_btn.configure(command=do_preventative)
+    upd_check_btn.configure(command=do_check_updates)
+    upd_go_btn.configure(command=do_apply_update)
+    upd_no_btn.configure(command=do_dismiss_update)
+    crash_btn.configure(command=open_crash_reports)
     refresh_monthly()
 
     if IS_WINDOWS and is_admin():
@@ -3909,12 +4472,20 @@ def launch_gui():
                      "faked and nothing can be fixed from here.")
         fix_btn.configure(state="disabled")
 
+    auto_update_check()
     drain_log()
     root.mainloop()
     return 0
 
 
 def main(argv=None):
+    # Crash capture first — as early as the app allows (v1.1.1),
+    # then clear any stale state a killed run left behind.
+    install_crash_hooks()
+    try:
+        cleanup_stale_state()
+    except Exception:
+        pass
     parser = argparse.ArgumentParser(description=APP_NAME)
     parser.add_argument("--self-test", action="store_true",
                         help="run the headless logic self-test")
@@ -4447,12 +5018,8 @@ def history_path():
 
 
 def load_history():
-    try:
-        with open(history_path(), "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {"runs": []}
-    except (OSError, ValueError):
-        return {"runs": []}
+    return load_json_store(history_path(), _salvage_history,
+                           lambda: {"runs": []}, HISTORY_FILE)
 
 
 def record_history(summary, when=None):
@@ -4463,11 +5030,7 @@ def record_history(summary, when=None):
                           ).isoformat(timespec="seconds"),
                  "summary": summary})
     hist["runs"] = runs[-24:]
-    try:
-        with open(history_path(), "w", encoding="utf-8") as fh:
-            json.dump(hist, fh, indent=1)
-    except OSError:
-        pass
+    save_json_store(history_path(), hist)
     return prev
 
 
@@ -6526,13 +7089,10 @@ def preventative_path():
 
 
 def load_preventative_history(path=None):
-    try:
-        with open(path or preventative_path(), "r",
-                  encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {"scans": []}
-    except (OSError, ValueError):
-        return {"scans": []}
+    return load_json_store(path or preventative_path(),
+                           _salvage_preventative,
+                           lambda: {"scans": []},
+                           "preventative-history.json")
 
 
 def record_preventative(data, path=None):
@@ -6543,12 +7103,7 @@ def record_preventative(data, path=None):
     prev = scans[-1]["data"] if scans else None
     scans.append({"when": data.get("collected_at"), "data": data})
     hist["scans"] = scans[-24:]
-    try:
-        with open(path or preventative_path(), "w",
-                  encoding="utf-8") as fh:
-            json.dump(hist, fh, indent=1)
-    except OSError:
-        pass
+    save_json_store(path or preventative_path(), hist)
     return prev
 
 
@@ -6589,21 +7144,17 @@ def auto_check_path():
 
 
 def auto_check_mode(path=None):
-    try:
-        with open(path or auto_check_path(), "r",
-                  encoding="utf-8") as fh:
-            mode = json.load(fh).get("mode")
-        return mode if mode in AUTO_CHECK_MODES else "monthly"
-    except (OSError, ValueError, AttributeError):
-        return "monthly"
+    store = load_json_store(path or auto_check_path(),
+                            _salvage_auto_check,
+                            lambda: {"mode": "monthly"},
+                            "auto-check.json")
+    return store["mode"]
 
 
 def save_auto_check_mode(mode, path=None):
     if mode not in AUTO_CHECK_MODES:
         raise ValueError("unknown auto-check mode: %s" % mode)
-    with open(path or auto_check_path(), "w",
-              encoding="utf-8") as fh:
-        json.dump({"mode": mode}, fh)
+    save_json_store(path or auto_check_path(), {"mode": mode})
     return mode
 
 
@@ -6616,6 +7167,815 @@ def auto_check_schtasks_args(mode, action, task_name=None):
     else:
         args += ["/SC", "MONTHLY", "/D", "1"]
     return args
+
+
+# ----------------------------------------------------------------------
+# Self-repair of the app's own state (v1.1.1) — the standing rule
+# (2026-10-17): recoverable problems in the app's OWN state are
+# detected and repaired under three conditions: (1) conservative —
+# only verifiable, reversible repairs (a corrupt file is
+# quarantined, never deleted; every save first keeps the previous
+# good copy as a .bak); (2) verified — the store is re-read after
+# the repair and success is claimed only when it parses cleanly;
+# (3) logged — every attempt lands in the repair log surfaced by
+# "Crash & error reports", marked repaired / repair-failed.
+# Code bugs are NOT self-repairable — they surface as crash
+# reports and are fixed by an update.
+# ----------------------------------------------------------------------
+
+REPAIR_EVENTS_FILE = "repair-events.json"
+REPAIR_EVENTS_MAX = 50
+
+
+def repair_events_path(base=None):
+    return os.path.join(base or app_dir(), REPAIR_EVENTS_FILE)
+
+
+def load_repair_events(path=None):
+    """The repair log, oldest first. Read plainly — the repair
+    machinery never repairs its own log (no recursion)."""
+    try:
+        with open(path or repair_events_path(), "r",
+                  encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def record_repair_event(what, result, detail="", path=None):
+    """Append one event (result: 'repaired' or 'repair-failed')
+    to the repair log and mirror it into the app's log. Never
+    raises — reporting a repair must not break the app."""
+    event = {"when": datetime.datetime.now().isoformat(
+                 timespec="seconds"),
+             "what": what, "result": result, "detail": detail}
+    try:
+        events = load_repair_events(path)
+        events.append(event)
+        with open(path or repair_events_path(), "w",
+                  encoding="utf-8") as fh:
+            json.dump(events[-REPAIR_EVENTS_MAX:], fh, indent=1)
+    except OSError:
+        pass
+    try:
+        if _ACTIVE_LOG is not None:
+            _ACTIVE_LOG("Self-repair (%s): %s — %s"
+                        % (result, what, detail))
+    except Exception:
+        pass
+    return event
+
+
+def _read_json_file(path):
+    """(data, error) — data is None when unreadable or corrupt."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh), None
+    except (OSError, ValueError) as exc:
+        return None, exc
+
+
+def _write_json_file(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=1)
+        return True
+    except OSError:
+        return False
+
+
+def _backup_good_copy(path):
+    """Keep the store's current GOOD contents as <path>.bak —
+    the copy a later repair restores from."""
+    data, err = _read_json_file(path)
+    if err is None and data is not None:
+        _write_json_file(path + ".bak", data)
+
+
+def save_json_store(path, data):
+    """Save a JSON store, first preserving the previous good copy
+    as its backup. Returns True when written."""
+    _backup_good_copy(path)
+    return _write_json_file(path, data)
+
+
+def _quarantine_file(path, when=None):
+    """Rename a corrupt file aside — never delete it. Returns the
+    quarantine path or None."""
+    when = when or datetime.datetime.now()
+    dest = "%s.corrupt-%s" % (path, when.strftime("%Y%m%d-%H%M%S"))
+    try:
+        os.replace(path, dest)
+        return dest
+    except OSError:
+        return None
+
+
+def load_json_store(path, salvage, default, label):
+    """Load one of the app's JSON stores, with self-repair.
+
+    salvage(data) returns the canonical store — keeping whatever
+    is salvageable — or None when the shape is unusable;
+    default() builds a fresh store. A missing file is not
+    corruption: the default comes back quietly, nothing written.
+    A corrupt file is restored from its .bak when that is valid,
+    else quarantined and rebuilt from defaults; either way the
+    repair is verified by re-reading the store, and logged.
+    """
+    if not os.path.exists(path):
+        return default()
+    epath = os.path.join(
+        os.path.dirname(os.path.abspath(path)), REPAIR_EVENTS_FILE)
+    data, err = _read_json_file(path)
+    if err is None:
+        cleaned = salvage(data)
+        if cleaned is not None:
+            if cleaned != data:
+                if save_json_store(path, cleaned) and \
+                        _read_json_file(path)[0] == cleaned:
+                    record_repair_event(
+                        label, "repaired",
+                        "kept the salvageable data and rebuilt "
+                        "the rest", path=epath)
+                else:
+                    record_repair_event(
+                        label, "repair-failed",
+                        "salvaged data could not be saved back",
+                        path=epath)
+            return cleaned
+    bak, bak_err = _read_json_file(path + ".bak")
+    if bak_err is None:
+        cleaned_bak = salvage(bak)
+        if cleaned_bak is not None:
+            if _write_json_file(path, cleaned_bak) and \
+                    _read_json_file(path)[0] == cleaned_bak:
+                record_repair_event(
+                    label, "repaired",
+                    "the file was corrupt and was restored from "
+                    "its last good copy", path=epath)
+                return cleaned_bak
+    kept = _quarantine_file(path)
+    rebuilt = default()
+    if _write_json_file(path, rebuilt) and \
+            _read_json_file(path)[0] == rebuilt:
+        record_repair_event(
+            label, "repaired",
+            "the file was corrupt and was rebuilt from defaults"
+            + ("; the corrupt copy was kept as %s"
+               % os.path.basename(kept) if kept else ""),
+            path=epath)
+        return rebuilt
+    record_repair_event(
+        label, "repair-failed",
+        "the file was corrupt and could not be rebuilt",
+        path=epath)
+    return rebuilt
+
+
+def _salvage_update_state(data):
+    if not isinstance(data, dict):
+        return None
+    return {k: data[k]
+            for k in ("last_check", "last_seen_version",
+                      "dismissed_version")
+            if isinstance(data.get(k), str)}
+
+
+def _salvage_auto_check(data):
+    if not isinstance(data, dict):
+        return None
+    mode = data.get("mode")
+    return {"mode": mode if mode in AUTO_CHECK_MODES else "monthly"}
+
+
+def _salvage_preventative(data):
+    if not isinstance(data, dict):
+        return None
+    scans = data.get("scans")
+    if not isinstance(scans, list):
+        return {"scans": []}
+    return {"scans": [s for s in scans
+                      if isinstance(s, dict)
+                      and isinstance(s.get("data"), dict)]}
+
+
+def _salvage_history(data):
+    if not isinstance(data, dict):
+        return None
+    runs = data.get("runs")
+    if not isinstance(runs, list):
+        return {"runs": []}
+    return {"runs": [r for r in runs
+                     if isinstance(r, dict)
+                     and isinstance(r.get("summary"), dict)]}
+
+
+def cleanup_stale_state(base=None):
+    """Startup tidy-up for state a killed run can leave behind:
+    abandoned update downloads (a verified installer is only ever
+    launched in the run that downloaded it, so a leftover is
+    never used) and stray temp files next to the app. Returns
+    plain-language lines about what was cleared; a repair event
+    is logged only when something actually was cleared."""
+    base = base or app_dir()
+    cleared = []
+    for folder, label in ((os.path.join(base, UPDATE_DIR_NAME),
+                           "leftover update download"),):
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            names = []
+        for name in names:
+            path = os.path.join(folder, name)
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+                    cleared.append("%s: %s" % (label, name))
+            except OSError:
+                pass
+    try:
+        names = os.listdir(base)
+    except OSError:
+        names = []
+    for name in names:
+        if name.endswith((".tmp", ".part")):
+            path = os.path.join(base, name)
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+                    cleared.append("stray temp file: %s" % name)
+            except OSError:
+                pass
+    if cleared:
+        record_repair_event(
+            "startup cleanup", "repaired",
+            "cleared %s left behind by an earlier run"
+            % ", ".join(cleared),
+            path=os.path.join(base, REPAIR_EVENTS_FILE))
+    return cleared
+
+
+def discard_download(path):
+    """Delete a downloaded file that failed verification — it
+    must never be installed. True when it's gone either way."""
+    try:
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+# ----------------------------------------------------------------------
+# App updates (v1.1.1) — the standing rule (2026-10-15): every app
+# ships an update feature from within the app. This one checks the
+# app's own GitHub releases, shows ONE subtle notice per version
+# (dismissed = never shown again for that version), and installs
+# ONLY when the user taps Update. The downloaded installer is
+# verified before it is launched: size always, SHA-256 whenever an
+# expected hash exists (the release's checksum file when attached,
+# else the digest GitHub itself reports for the asset). A failed
+# verification means nothing runs and the user gets the manual
+# download link instead.
+# ----------------------------------------------------------------------
+
+UPDATE_REPO = "smartyourtv/windows-health-repair"
+UPDATE_API_LATEST = ("https://api.github.com/repos/%s/releases/latest"
+                     % UPDATE_REPO)
+UPDATE_RELEASES_PAGE = "https://github.com/%s/releases" % UPDATE_REPO
+# Must match "setup_name" in packaging/app-config.json.
+UPDATE_SETUP_NAME = "WindowsHealthRepair-Setup.exe"
+UPDATE_CHECKSUM_NAME = UPDATE_SETUP_NAME + ".sha256"
+UPDATE_FILE = "update-state.json"
+UPDATE_DIR_NAME = "updates"
+UPDATE_CHECK_INTERVAL_HOURS = 24
+_UPDATE_UA = "%s/%s (in-app update check)" % (
+    UPDATE_SETUP_NAME.replace("-Setup.exe", ""), APP_VERSION)
+
+
+def parse_version(text):
+    """'v1.2.3' / '1.2.3' -> (1, 2, 3); None when not a version."""
+    if not text:
+        return None
+    s = str(text).strip().lstrip("vV")
+    s = s.split("-", 1)[0].split("+", 1)[0]
+    nums = []
+    for part in s.split("."):
+        if not part.isdigit():
+            return None
+        nums.append(int(part))
+    return tuple(nums) if nums else None
+
+
+def is_newer_version(candidate, current=None):
+    """True when candidate is strictly newer than current
+    (default: the running APP_VERSION). Unparseable = not newer."""
+    cand = parse_version(candidate)
+    cur = parse_version(current or APP_VERSION)
+    if cand is None or cur is None:
+        return False
+    n = max(len(cand), len(cur))
+    cand += (0,) * (n - len(cand))
+    cur += (0,) * (n - len(cur))
+    return cand > cur
+
+
+def update_state_path():
+    return os.path.join(app_dir(), UPDATE_FILE)
+
+
+def load_update_state(path=None):
+    return load_json_store(path or update_state_path(),
+                           _salvage_update_state, dict,
+                           "update-state.json")
+
+
+def save_update_state(state, path=None):
+    return save_json_store(path or update_state_path(), state)
+
+
+def update_check_due(state, now=None,
+                     interval_hours=UPDATE_CHECK_INTERVAL_HOURS):
+    """Throttling for the automatic launch check: at most one
+    automatic check per interval, however often the app opens."""
+    last = (state or {}).get("last_check")
+    if not last:
+        return True
+    try:
+        when = datetime.datetime.fromisoformat(last)
+    except (TypeError, ValueError):
+        return True
+    now = now or datetime.datetime.now()
+    return (now - when) >= datetime.timedelta(hours=interval_hours)
+
+
+def record_update_check(state, latest_version=None, now=None,
+                        path=None):
+    """Remember that a check happened (and what it saw)."""
+    state = dict(state or {})
+    state["last_check"] = (now or datetime.datetime.now()).isoformat(
+        timespec="seconds")
+    if latest_version:
+        state["last_seen_version"] = latest_version
+    save_update_state(state, path)
+    return state
+
+
+def update_notice_wanted(state, latest_version, current=None):
+    """The notice rule: show only when the latest release is newer
+    than the running app AND the user has not already dismissed
+    the notice for exactly that version."""
+    if not is_newer_version(latest_version, current):
+        return False
+    return (state or {}).get("dismissed_version") != latest_version
+
+
+def dismiss_update_notice(state, version, path=None):
+    state = dict(state or {})
+    state["dismissed_version"] = version
+    save_update_state(state, path)
+    return state
+
+
+def parse_release(data):
+    """GitHub release JSON -> normalized update info, or None when
+    the payload doesn't describe a usable release."""
+    if not isinstance(data, dict):
+        return None
+    tag = str(data.get("tag_name") or "").strip()
+    if parse_version(tag) is None:
+        return None
+    info = {
+        "tag": tag,
+        "version": tag.lstrip("vV"),
+        "name": data.get("name") or tag,
+        "page": data.get("html_url") or UPDATE_RELEASES_PAGE,
+        "setup": None,
+        "checksum_url": None,
+    }
+    for asset in data.get("assets") or []:
+        name = asset.get("name") or ""
+        if name == UPDATE_SETUP_NAME:
+            digest = asset.get("digest") or ""
+            sha = None
+            if digest.startswith("sha256:"):
+                cand = digest.split(":", 1)[1].strip().lower()
+                if re.fullmatch(r"[0-9a-f]{64}", cand):
+                    sha = cand
+            info["setup"] = {
+                "name": name,
+                "size": asset.get("size"),
+                "url": asset.get("browser_download_url") or "",
+                "sha256": sha,
+            }
+        elif name == UPDATE_CHECKSUM_NAME:
+            info["checksum_url"] = (
+                asset.get("browser_download_url") or "")
+    return info
+
+
+def _exc_text(exc):
+    return str(getattr(exc, "reason", exc))[:160]
+
+
+def _open_url(url, opener=None, timeout=30):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": _UPDATE_UA,
+        "Accept": "application/vnd.github+json",
+    })
+    return (opener or urllib.request.urlopen)(req, timeout=timeout)
+
+
+def fetch_latest_release(opener=None, timeout=30):
+    """(info, error) — exactly one of the two is not None. Errors
+    are plain-language; nothing here raises."""
+    try:
+        with _open_url(UPDATE_API_LATEST, opener, timeout) as resp:
+            raw = resp.read()
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        return None, ("GitHub answered with an error (HTTP %s)."
+                      % exc.code)
+    except (urllib.error.URLError, OSError) as exc:
+        return None, "Could not reach GitHub (%s)." % _exc_text(exc)
+    except ValueError:
+        return None, "GitHub's answer could not be understood."
+    info = parse_release(data)
+    if info is None:
+        return None, "GitHub's answer did not include a release."
+    return info, None
+
+
+def parse_checksum_text(text):
+    """sha256sum output ('<hex>  <name>') or a bare hash -> hex."""
+    for token in (text or "").split():
+        token = token.strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", token):
+            return token
+    return None
+
+
+def fetch_expected_sha256(info, opener=None, timeout=30):
+    """Best expected SHA-256 for the installer: the release's
+    checksum file when one is attached, else the digest GitHub
+    itself reports for the asset, else None (size-only check)."""
+    if (info or {}).get("checksum_url"):
+        try:
+            with _open_url(info["checksum_url"], opener,
+                           timeout) as resp:
+                text = resp.read().decode("utf-8", "replace")
+            sha = parse_checksum_text(text)
+            if sha:
+                return sha
+        except (urllib.error.URLError, OSError):
+            pass
+    setup = (info or {}).get("setup") or {}
+    return setup.get("sha256")
+
+
+def update_download_path(dest_dir=None):
+    folder = dest_dir or os.path.join(app_dir(), UPDATE_DIR_NAME)
+    return os.path.join(folder, UPDATE_SETUP_NAME)
+
+
+def download_update(info, dest_dir=None, opener=None, timeout=120,
+                    progress=None):
+    """(path, error) — streams the installer to disk; a partial
+    file is never left behind on failure."""
+    setup = (info or {}).get("setup") or {}
+    url = setup.get("url")
+    if not url:
+        return None, "The release does not offer the installer file."
+    dest = update_download_path(dest_dir)
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+    except OSError as exc:
+        return None, ("Could not create the download folder (%s)."
+                      % exc)
+    total = setup.get("size") or 0
+    done = 0
+    try:
+        with _open_url(url, opener, timeout) as resp, \
+                open(dest, "wb") as fh:
+            while True:
+                chunk = resp.read(262144)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                done += len(chunk)
+                if progress:
+                    progress(done, total)
+    except (urllib.error.URLError, OSError) as exc:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        return None, ("The download did not finish (%s)."
+                      % _exc_text(exc))
+    return dest, None
+
+
+def sha256_of_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(262144), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify_download(path, expected_size=None, expected_sha256=None):
+    """(ok, message). Size is checked whenever it is known;
+    SHA-256 whenever an expected hash is available. Nothing is
+    treated as verified on hope."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False, "The downloaded file could not be found."
+    if expected_size and size != expected_size:
+        return False, ("The download is the wrong size (%s bytes "
+                       "instead of %s) — it may be incomplete, so "
+                       "it will NOT be run."
+                       % (size, expected_size))
+    if expected_sha256:
+        if sha256_of_file(path) != expected_sha256.lower():
+            return False, ("The download's fingerprint (SHA-256) "
+                           "does not match the release — for "
+                           "safety it will NOT be run.")
+        return True, ("Verified: the size and SHA-256 fingerprint "
+                      "match the release.")
+    return True, ("Verified: the size matches the release (no "
+                  "SHA-256 fingerprint was available to check "
+                  "against).")
+
+
+def launch_update_installer(path):
+    """Start the downloaded installer. The caller exits the app
+    right after, so the per-user install can replace this copy."""
+    subprocess.Popen([path])
+
+
+# ----------------------------------------------------------------------
+# Crash & error reports (v1.1.1) — the standing rule (2026-10-17):
+# every app surfaces its crashes TWO ways — (1) a report FILE in
+# the user's Downloads folder, written synchronously when the
+# crash happens, and (2) an in-app "Crash & error reports" view.
+# Reports are NEVER auto-uploaded anywhere; they stay on this PC
+# until the user shares one. The capture hooks (sys.excepthook,
+# threading.excepthook, Tk's callback hook) are installed by
+# main() as early as the app allows, and the report's log tail
+# comes from the app's existing RunLog — no parallel logging.
+# ----------------------------------------------------------------------
+
+CRASH_PREFIX = "WindowsHealthRepair-crash-"
+CRASH_TAIL_LINES = 80
+_CRASH_NAME_RE = re.compile(
+    r"^WindowsHealthRepair-crash-\d{8}-\d{6}\.txt$")
+_CRASH_GUARD = {"last": 0.0, "count": 0}
+_CRASH_MAX_PER_RUN = 5
+_CRASH_MIN_SECONDS = 5.0
+
+
+def _known_downloads_folder():
+    """The shell's real Downloads folder on Windows (it can be
+    redirected, e.g. to OneDrive); None anywhere else/on failure."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        class _GUID(ctypes.Structure):
+            _fields_ = [("Data1", ctypes.c_ulong),
+                        ("Data2", ctypes.c_ushort),
+                        ("Data3", ctypes.c_ushort),
+                        ("Data4", ctypes.c_ubyte * 8)]
+        # FOLDERID_Downloads = {374DE290-123F-4565-9164-39C4925E467B}
+        guid = _GUID(0x374DE290, 0x123F, 0x4565,
+                     (ctypes.c_ubyte * 8)(
+                         0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E,
+                         0x46, 0x7B))
+        ptr = ctypes.c_wchar_p()
+        rc = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(guid), 0, None, ctypes.byref(ptr))
+        if rc != 0 or not ptr.value:
+            return None
+        try:
+            return ptr.value
+        finally:
+            ctypes.windll.ole32.CoTaskMemFree(ptr)
+    except Exception:
+        return None
+
+
+def downloads_dir():
+    """The user's Downloads folder (known folder on Windows, else
+    %USERPROFILE%\\Downloads, else ~/Downloads)."""
+    known = _known_downloads_folder()
+    if known:
+        return known
+    home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    return os.path.join(home, "Downloads")
+
+
+def windows_version_text():
+    """One-line OS description for reports; never raises."""
+    try:
+        return platform.platform() or sys.platform
+    except Exception:
+        return sys.platform
+
+
+def crash_report_name(when=None):
+    when = when or datetime.datetime.now()
+    return "%s%s.txt" % (CRASH_PREFIX,
+                         when.strftime("%Y%m%d-%H%M%S"))
+
+
+def log_tail(lines, n=CRASH_TAIL_LINES):
+    """The last n log lines (the crash report's tail)."""
+    lines = list(lines or [])
+    return lines[-n:] if n else lines
+
+
+def build_crash_report(exc_type, exc_value, tb, when=None,
+                       log_lines=None):
+    """The report text: plain-language summary first, then the
+    facts — timestamp, app + Windows version, exception, traceback,
+    and the tail of the app's own log."""
+    when = when or datetime.datetime.now()
+    out = []
+    out.append("%s ran into an unexpected problem and saved this "
+               "report." % APP_NAME)
+    out.append("Nothing was sent anywhere — this file only exists "
+               "on this PC. You can share it with whoever helps "
+               "you, or delete it.")
+    out.append("")
+    out.append("When: %s" % when.strftime("%Y-%m-%d %H:%M:%S"))
+    out.append("App: %s %s" % (APP_NAME, APP_VERSION))
+    out.append("System: %s" % windows_version_text())
+    out.append("What happened: %s: %s"
+               % (getattr(exc_type, "__name__", str(exc_type)),
+                  exc_value))
+    out.append("")
+    out.append("Details (for whoever helps you):")
+    if tb is not None:
+        try:
+            te = traceback.TracebackException(exc_type, exc_value,
+                                              tb)
+            out.extend("".join(te.format()).rstrip().splitlines())
+        except Exception:
+            out.append("(the traceback could not be formatted)")
+    else:
+        out.append("(no traceback available)")
+    out.append("")
+    tail = log_tail(log_lines)
+    out.append("Last %d lines of the app's log:" % len(tail)
+               if tail else "The app's log:")
+    if tail:
+        out.extend(tail)
+    else:
+        out.append("(no log lines were captured)")
+    return "\n".join(out) + "\n"
+
+
+def crash_report_dirs():
+    """Where reports live, best first: the Downloads folder, then
+    next to the app (only if Downloads can't be written)."""
+    dirs = []
+    try:
+        dirs.append(downloads_dir())
+    except Exception:
+        pass
+    dirs.append(app_dir())
+    return dirs
+
+
+def write_crash_report(exc_type, exc_value, tb, when=None, log=None,
+                       dirs=None):
+    """Write the report and return its path, or None. NEVER
+    raises — a crash handler that crashes helps no one."""
+    try:
+        lg = log if log is not None else _ACTIVE_LOG
+        text = build_crash_report(
+            exc_type, exc_value, tb, when=when,
+            log_lines=lg.lines if lg is not None else None)
+        name = crash_report_name(when)
+        for folder in (dirs if dirs is not None
+                       else crash_report_dirs()):
+            try:
+                os.makedirs(folder, exist_ok=True)
+                path = os.path.join(folder, name)
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                return path
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _crash_write_allowed(now=None):
+    """Rate guard: a looping error must not fill the disk with
+    reports — at most one per few seconds, a handful per run."""
+    import time as _time
+    t = _time.time() if now is None else now
+    if _CRASH_GUARD["count"] >= _CRASH_MAX_PER_RUN:
+        return False
+    if t - _CRASH_GUARD["last"] < _CRASH_MIN_SECONDS:
+        return False
+    _CRASH_GUARD["last"] = t
+    _CRASH_GUARD["count"] += 1
+    return True
+
+
+def handle_unhandled_exception(exc_type, exc_value, tb):
+    """Crash-capture entry point: write a report (rate-guarded)
+    and return its path or None. Interpreter exits are not
+    crashes and are never reported."""
+    try:
+        if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+            return None
+    except Exception:
+        return None
+    if not _crash_write_allowed():
+        return None
+    return write_crash_report(exc_type, exc_value, tb)
+
+
+_DEFAULT_EXCEPTHOOK = sys.excepthook
+_PREV_THREAD_HOOK = None
+
+
+def _sys_excepthook(exc_type, exc_value, tb):
+    handle_unhandled_exception(exc_type, exc_value, tb)
+    _DEFAULT_EXCEPTHOOK(exc_type, exc_value, tb)
+
+
+def _thread_excepthook(args):
+    handle_unhandled_exception(args.exc_type, args.exc_value,
+                               args.exc_traceback)
+    prev = _PREV_THREAD_HOOK
+    if prev is not None and prev is not _thread_excepthook:
+        try:
+            prev(args)
+        except Exception:
+            pass
+
+
+def install_crash_hooks():
+    """Install the global capture (main thread + worker threads).
+    Called at the top of main() — as early as the app allows.
+    Idempotent."""
+    global _PREV_THREAD_HOOK
+    if sys.excepthook is not _sys_excepthook:
+        sys.excepthook = _sys_excepthook
+    if hasattr(threading, "excepthook") \
+            and threading.excepthook is not _thread_excepthook:
+        _PREV_THREAD_HOOK = threading.excepthook
+        threading.excepthook = _thread_excepthook
+
+
+def list_crash_reports(dirs=None):
+    """Saved crash reports, newest first:
+    [{name, path, mtime, size}]."""
+    out = []
+    seen = set()
+    for folder in (dirs if dirs is not None
+                   else crash_report_dirs()):
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
+            if not _CRASH_NAME_RE.match(name) or name in seen:
+                continue
+            path = os.path.join(folder, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            seen.add(name)
+            out.append({"name": name, "path": path,
+                        "mtime": st.st_mtime, "size": st.st_size})
+    out.sort(key=lambda r: r["mtime"], reverse=True)
+    return out
+
+
+def read_crash_report(path):
+    with open(path, "r", encoding="utf-8",
+              errors="replace") as fh:
+        return fh.read()
+
+
+def delete_crash_report(path):
+    """Delete one report — and only ever one of ours."""
+    if not _CRASH_NAME_RE.match(os.path.basename(path or "")):
+        return False
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
 
 
 # Feature-pack scanners register into SCANNERS in display order

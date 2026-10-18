@@ -4,10 +4,15 @@ Everything here tests pure logic against recorded fixtures — the
 Windows-only command paths are never exercised on this machine and
 must present as honest 'needs Windows' states instead.
 """
+import hashlib
 import json
 import os
 import sys
+import tempfile
+import threading
 import unittest
+import urllib.error
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -1007,6 +1012,516 @@ class TestScheduleAndNewFixes(unittest.TestCase):
                                       wh.RunLog())
             self.assertFalse(ok)
             self.assertIn("needs Windows", msg)
+
+
+# ----------------------------------------------------------------------
+# v1.1.1 — in-app updater + crash & error reports
+# ----------------------------------------------------------------------
+
+class _FakeResp:
+    """Minimal HTTP response stand-in (context manager + read)."""
+
+    def __init__(self, data):
+        self._buf = data
+
+    def read(self, n=-1):
+        if n is None or n < 0:
+            out, self._buf = self._buf, b""
+            return out
+        out, self._buf = self._buf[:n], self._buf[n:]
+        return out
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _release_payload(version="9.9.9", size=123, sha="a" * 64,
+                     checksum=True):
+    assets = [{"name": wh.UPDATE_SETUP_NAME, "size": size,
+               "browser_download_url": "https://example.invalid/s",
+               "digest": "sha256:" + sha}]
+    if checksum:
+        assets.append({"name": wh.UPDATE_CHECKSUM_NAME,
+                       "browser_download_url":
+                           "https://example.invalid/c"})
+    return {"tag_name": "v" + version,
+            "html_url": "https://example.invalid/r",
+            "assets": assets}
+
+
+class TestInAppUpdater(unittest.TestCase):
+    def test_parse_version(self):
+        self.assertEqual(wh.parse_version("v1.2.3"), (1, 2, 3))
+        self.assertEqual(wh.parse_version("1.2"), (1, 2))
+        self.assertEqual(wh.parse_version("v2.0.0-rc1"), (2, 0, 0))
+        self.assertIsNone(wh.parse_version("soon"))
+        self.assertIsNone(wh.parse_version(""))
+        self.assertIsNone(wh.parse_version(None))
+
+    def test_is_newer_version_compares_numbers_not_text(self):
+        self.assertTrue(wh.is_newer_version("1.10.0", "1.9.9"))
+        self.assertTrue(wh.is_newer_version("v1.1.1", "1.1.0"))
+        self.assertFalse(wh.is_newer_version("1.1.0", "1.1.0"))
+        self.assertFalse(wh.is_newer_version("1.0.9", "1.1.0"))
+        self.assertFalse(wh.is_newer_version("junk", "1.1.0"))
+
+    def test_parse_release(self):
+        info = wh.parse_release(_release_payload())
+        self.assertEqual(info["version"], "9.9.9")
+        self.assertEqual(info["setup"]["size"], 123)
+        self.assertEqual(info["setup"]["sha256"], "a" * 64)
+        self.assertTrue(info["checksum_url"].endswith("/c"))
+
+    def test_parse_release_rejects_unusable_payloads(self):
+        self.assertIsNone(wh.parse_release(None))
+        self.assertIsNone(wh.parse_release({"tag_name": "hello"}))
+        info = wh.parse_release({"tag_name": "v1.0.0", "assets": []})
+        self.assertIsNone(info["setup"])
+        bad = _release_payload()
+        bad["assets"][0]["digest"] = "sha256:not-a-hash"
+        self.assertIsNone(wh.parse_release(bad)["setup"]["sha256"])
+
+    def test_notice_once_per_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "u.json")
+            self.assertTrue(wh.update_notice_wanted(
+                {}, "2.0.0", current="1.0.0"))
+            st = wh.dismiss_update_notice({}, "2.0.0", path=path)
+            self.assertFalse(wh.update_notice_wanted(
+                st, "2.0.0", current="1.0.0"))
+            self.assertTrue(wh.update_notice_wanted(
+                st, "2.0.1", current="1.0.0"))
+            self.assertFalse(wh.update_notice_wanted(
+                st, "1.0.0", current="1.0.0"))
+            self.assertEqual(wh.load_update_state(path), st)
+
+    def test_check_due_throttle(self):
+        now = wh.datetime.datetime(2026, 10, 17, 12, 0, 0)
+        self.assertTrue(wh.update_check_due({}, now=now))
+        self.assertFalse(wh.update_check_due(
+            {"last_check": "2026-10-17T11:00:00"}, now=now))
+        self.assertTrue(wh.update_check_due(
+            {"last_check": "2026-10-16T11:00:00"}, now=now))
+        self.assertTrue(wh.update_check_due(
+            {"last_check": "not a date"}, now=now))
+
+    def test_record_check_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "u.json")
+            st = wh.record_update_check({}, "9.9.9", path=path)
+            loaded = wh.load_update_state(path)
+            self.assertEqual(loaded["last_seen_version"], "9.9.9")
+            self.assertEqual(loaded["last_check"],
+                             st["last_check"])
+            self.assertFalse(wh.update_check_due(loaded))
+
+    def test_fetch_latest_release_ok(self):
+        payload = json.dumps(_release_payload()).encode()
+        info, err = wh.fetch_latest_release(
+            opener=lambda req, timeout=None: _FakeResp(payload))
+        self.assertIsNone(err)
+        self.assertEqual(info["version"], "9.9.9")
+
+    def test_fetch_latest_release_errors_are_plain(self):
+        def http_error(req, timeout=None):
+            raise urllib.error.HTTPError("https://x", 503, "e",
+                                         {}, None)
+        info, err = wh.fetch_latest_release(opener=http_error)
+        self.assertIsNone(info)
+        self.assertIn("503", err)
+
+        def unreachable(req, timeout=None):
+            raise urllib.error.URLError("down")
+        info, err = wh.fetch_latest_release(opener=unreachable)
+        self.assertIsNone(info)
+        self.assertIn("Could not reach GitHub", err)
+
+        info, err = wh.fetch_latest_release(
+            opener=lambda req, timeout=None: _FakeResp(b"no json"))
+        self.assertIsNone(info)
+        self.assertIsNotNone(err)
+
+    def test_expected_sha256_prefers_checksum_file(self):
+        info = wh.parse_release(_release_payload(sha="b" * 64))
+        text = ("a" * 64 + "  " + wh.UPDATE_SETUP_NAME).encode()
+        sha = wh.fetch_expected_sha256(
+            info, opener=lambda req, timeout=None: _FakeResp(text))
+        self.assertEqual(sha, "a" * 64)
+
+    def test_expected_sha256_falls_back_to_digest(self):
+        info = wh.parse_release(_release_payload(sha="b" * 64))
+
+        def unreachable(req, timeout=None):
+            raise urllib.error.URLError("down")
+        self.assertEqual(wh.fetch_expected_sha256(
+            info, opener=unreachable), "b" * 64)
+        info2 = wh.parse_release(_release_payload(
+            checksum=False, sha="b" * 64))
+        self.assertEqual(wh.fetch_expected_sha256(info2), "b" * 64)
+        info3 = wh.parse_release({"tag_name": "v1.0.0", "assets": [
+            {"name": wh.UPDATE_SETUP_NAME, "size": 1,
+             "browser_download_url": "https://example.invalid/s"}]})
+        self.assertIsNone(wh.fetch_expected_sha256(info3))
+
+    def test_download_and_verify(self):
+        blob = b"installer-bytes" * 30000
+        digest = hashlib.sha256(blob).hexdigest()
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            dest, err = wh.download_update(
+                {"setup": {"url": "https://example.invalid/s",
+                           "size": len(blob)}},
+                dest_dir=tmp,
+                opener=lambda req, timeout=None: _FakeResp(blob),
+                progress=lambda d, t: calls.append((d, t)))
+            self.assertIsNone(err)
+            self.assertEqual(calls[-1], (len(blob), len(blob)))
+            ok, _msg = wh.verify_download(dest, len(blob), digest)
+            self.assertTrue(ok)
+            ok, _ = wh.verify_download(dest, len(blob) + 1, digest)
+            self.assertFalse(ok)
+            ok, _ = wh.verify_download(dest, len(blob), "0" * 64)
+            self.assertFalse(ok)
+            ok, msg = wh.verify_download(dest, len(blob))
+            self.assertTrue(ok)
+            self.assertIn("SHA-256", msg)
+            ok, _ = wh.verify_download(dest + ".missing",
+                                       len(blob), digest)
+            self.assertFalse(ok)
+
+    def test_download_failure_leaves_no_partial_file(self):
+        class _FlakyResp:
+            def __init__(self):
+                self._reads = 0
+
+            def read(self, n=-1):
+                self._reads += 1
+                if self._reads == 1:
+                    return b"partial"
+                raise urllib.error.URLError("connection reset")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest, err = wh.download_update(
+                {"setup": {"url": "https://example.invalid/s",
+                           "size": 10}},
+                dest_dir=tmp,
+                opener=lambda req, timeout=None: _FlakyResp())
+            self.assertIsNone(dest)
+            self.assertIsNotNone(err)
+            self.assertFalse(os.path.exists(
+                os.path.join(tmp, wh.UPDATE_SETUP_NAME)))
+
+
+class TestCrashReports(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = self._tmp.name
+
+    def _raise(self, exc):
+        try:
+            raise exc
+        except Exception:
+            return sys.exc_info()
+
+    def test_downloads_dir_uses_userprofile(self):
+        if wh.IS_WINDOWS:
+            self.skipTest("known-folder path differs on Windows")
+        with mock.patch.dict(os.environ,
+                             {"USERPROFILE": self.dir}):
+            self.assertEqual(wh.downloads_dir(),
+                             os.path.join(self.dir, "Downloads"))
+
+    def test_report_name_format(self):
+        name = wh.crash_report_name(
+            wh.datetime.datetime(2026, 10, 17, 9, 5, 3))
+        self.assertEqual(
+            name, "WindowsHealthRepair-crash-20261017-090503.txt")
+        self.assertTrue(wh._CRASH_NAME_RE.match(name))
+
+    def test_write_report_contents(self):
+        when = wh.datetime.datetime(2026, 10, 17, 9, 5, 3)
+        log = wh.RunLog()
+        log("first line")
+        log("second line")
+        t, v, tb = self._raise(RuntimeError("kaput"))
+        path = wh.write_crash_report(t, v, tb, when=when,
+                                     dirs=[self.dir], log=log)
+        self.assertIsNotNone(path)
+        text = wh.read_crash_report(path)
+        self.assertIn("ran into an unexpected problem", text)
+        self.assertIn("Nothing was sent anywhere", text)
+        self.assertIn("When: 2026-10-17 09:05:03", text)
+        self.assertIn("App: %s %s" % (wh.APP_NAME, wh.APP_VERSION),
+                      text)
+        self.assertIn("RuntimeError: kaput", text)
+        self.assertIn("Traceback (most recent call last)", text)
+        self.assertIn("first line", text)
+        self.assertIn("second line", text)
+
+    def test_report_tail_is_only_the_tail(self):
+        log = wh.RunLog()
+        for i in range(120):
+            log("L%d" % i)
+        t, v, tb = self._raise(ValueError("x"))
+        path = wh.write_crash_report(t, v, tb, dirs=[self.dir],
+                                     log=log)
+        text = wh.read_crash_report(path)
+        self.assertIn("Last %d lines" % wh.CRASH_TAIL_LINES, text)
+        self.assertIn("L119", text)
+        self.assertIn("L40", text)
+        self.assertNotIn("L39", text)
+
+    def test_list_reports_newest_first_and_filtered(self):
+        older = os.path.join(
+            self.dir, wh.crash_report_name(
+                wh.datetime.datetime(2026, 10, 16, 8, 0, 0)))
+        newer = os.path.join(
+            self.dir, wh.crash_report_name(
+                wh.datetime.datetime(2026, 10, 17, 8, 0, 0)))
+        for p in (older, newer):
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("report")
+        os.utime(older, (1000, 1000))
+        os.utime(newer, (2000, 2000))
+        for decoy in ("notes.txt",
+                      "WindowsHealthRepair-crash-bad.txt"):
+            with open(os.path.join(self.dir, decoy), "w") as fh:
+                fh.write("nope")
+        reports = wh.list_crash_reports(dirs=[self.dir])
+        self.assertEqual([r["path"] for r in reports],
+                         [newer, older])
+
+    def test_list_dedupes_same_name_across_dirs(self):
+        other = os.path.join(self.dir, "elsewhere")
+        os.makedirs(other)
+        name = wh.crash_report_name(
+            wh.datetime.datetime(2026, 10, 17, 8, 0, 0))
+        for folder in (self.dir, other):
+            with open(os.path.join(folder, name), "w") as fh:
+                fh.write("report")
+        reports = wh.list_crash_reports(dirs=[self.dir, other])
+        self.assertEqual(len(reports), 1)
+
+    def test_delete_report(self):
+        path = os.path.join(
+            self.dir, wh.crash_report_name(
+                wh.datetime.datetime(2026, 10, 17, 8, 0, 0)))
+        with open(path, "w") as fh:
+            fh.write("report")
+        self.assertTrue(wh.delete_crash_report(path))
+        self.assertFalse(os.path.exists(path))
+        decoy = os.path.join(self.dir, "important.txt")
+        with open(decoy, "w") as fh:
+            fh.write("keep me")
+        self.assertFalse(wh.delete_crash_report(decoy))
+        self.assertTrue(os.path.exists(decoy))
+        self.assertFalse(wh.delete_crash_report(path))
+
+    def test_handle_unhandled_exception(self):
+        old_guard = dict(wh._CRASH_GUARD)
+        try:
+            wh._CRASH_GUARD.update({"last": 0.0, "count": 0})
+            with mock.patch.object(
+                    wh, "crash_report_dirs",
+                    lambda: [self.dir]):
+                self.assertIsNone(wh.handle_unhandled_exception(
+                    KeyboardInterrupt, KeyboardInterrupt(), None))
+                t, v, tb = self._raise(ValueError("handled"))
+                path = wh.handle_unhandled_exception(t, v, tb)
+                self.assertIsNotNone(path)
+                self.assertTrue(os.path.exists(path))
+                # Rate guard: an immediate second crash is skipped.
+                self.assertIsNone(
+                    wh.handle_unhandled_exception(t, v, tb))
+        finally:
+            wh._CRASH_GUARD.update(old_guard)
+
+    def test_hooks_install_is_idempotent(self):
+        old_sys = sys.excepthook
+        old_thread = threading.excepthook
+        try:
+            wh.install_crash_hooks()
+            self.assertIs(sys.excepthook, wh._sys_excepthook)
+            self.assertIs(threading.excepthook,
+                          wh._thread_excepthook)
+            prev = wh._PREV_THREAD_HOOK
+            wh.install_crash_hooks()
+            self.assertIs(wh._PREV_THREAD_HOOK, prev)
+        finally:
+            sys.excepthook = old_sys
+            threading.excepthook = old_thread
+
+    def test_gui_contract_crash_reports(self):
+        src = open(os.path.join(os.path.dirname(__file__), "..",
+                                "windows_health.py"),
+                   encoding="utf-8").read()
+        self.assertIn("Crash & error reports", src)
+        self.assertIn("report_callback_exception", src)
+        self.assertIn("install_crash_hooks()", src)
+
+
+class TestSelfRepair(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = self._tmp.name
+
+    def _store(self, name="store.json"):
+        return os.path.join(self.dir, name)
+
+    def _events(self):
+        return wh.load_repair_events(
+            path=os.path.join(self.dir, wh.REPAIR_EVENTS_FILE))
+
+    def test_save_rotates_previous_good_copy_to_bak(self):
+        path = self._store()
+        self.assertTrue(wh.save_json_store(path, {"a": 1}))
+        self.assertTrue(wh.save_json_store(path, {"a": 2}))
+        self.assertEqual(wh._read_json_file(path)[0], {"a": 2})
+        self.assertEqual(wh._read_json_file(path + ".bak")[0],
+                         {"a": 1})
+
+    def test_missing_file_is_not_corruption(self):
+        path = self._store()
+        data = wh.load_json_store(path, wh._salvage_auto_check,
+                                  lambda: {"mode": "monthly"},
+                                  "test store")
+        self.assertEqual(data, {"mode": "monthly"})
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(self._events(), [])
+
+    def test_corrupt_store_restored_from_bak(self):
+        path = self._store()
+        with open(path, "w") as fh:
+            fh.write("{corrupt")
+        wh._write_json_file(path + ".bak", {"mode": "weekly"})
+        data = wh.load_json_store(path, wh._salvage_auto_check,
+                                  lambda: {"mode": "monthly"},
+                                  "test store")
+        self.assertEqual(data, {"mode": "weekly"})
+        # Verified by re-read: the store itself is good again.
+        self.assertEqual(wh._read_json_file(path)[0],
+                         {"mode": "weekly"})
+        events = self._events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["result"], "repaired")
+        self.assertIn("last good copy", events[0]["detail"])
+
+    def test_corrupt_store_no_bak_rebuilds_and_quarantines(self):
+        path = self._store()
+        with open(path, "w") as fh:
+            fh.write("junk!")
+        data = wh.load_json_store(path, wh._salvage_auto_check,
+                                  lambda: {"mode": "monthly"},
+                                  "test store")
+        self.assertEqual(data, {"mode": "monthly"})
+        quarantined = [n for n in os.listdir(self.dir)
+                       if n.startswith("store.json.corrupt-")]
+        self.assertEqual(len(quarantined), 1)
+        with open(os.path.join(self.dir, quarantined[0])) as fh:
+            self.assertEqual(fh.read(), "junk!")
+        self.assertEqual(wh._read_json_file(path)[0],
+                         {"mode": "monthly"})
+        self.assertEqual(self._events()[0]["result"], "repaired")
+
+    def test_salvage_keeps_good_entries(self):
+        path = self._store()
+        wh._write_json_file(path, {"scans": [
+            {"when": "t1", "data": {"x": 1}},
+            {"nope": True},
+            "junk",
+            {"when": "t2", "data": {}}]})
+        data = wh.load_json_store(path, wh._salvage_preventative,
+                                  lambda: {"scans": []},
+                                  "test store")
+        self.assertEqual(data, {"scans": [
+            {"when": "t1", "data": {"x": 1}},
+            {"when": "t2", "data": {}}]})
+        self.assertEqual(self._events()[0]["result"], "repaired")
+
+    def test_update_state_salvage_drops_unknown_and_bad_keys(self):
+        data = wh._salvage_update_state(
+            {"last_check": "2026-10-17T00:00:00", "evil": 1,
+             "dismissed_version": 5})
+        self.assertEqual(data,
+                         {"last_check": "2026-10-17T00:00:00"})
+        self.assertIsNone(wh._salvage_update_state([1, 2, 3]))
+
+    def test_valid_store_loads_quietly(self):
+        path = self._store()
+        wh._write_json_file(path, {"mode": "weekly"})
+        data = wh.load_json_store(path, wh._salvage_auto_check,
+                                  lambda: {"mode": "monthly"},
+                                  "test store")
+        self.assertEqual(data, {"mode": "weekly"})
+        self.assertEqual(self._events(), [])
+
+    def test_repair_failed_is_reported_not_raised(self):
+        blocker = os.path.join(self.dir, "blocker")
+        with open(blocker, "w") as fh:
+            fh.write("a file, not a folder")
+        path = os.path.join(blocker, "store.json")
+        data = wh.load_json_store(path, wh._salvage_auto_check,
+                                  lambda: {"mode": "monthly"},
+                                  "test store")
+        self.assertEqual(data, {"mode": "monthly"})
+
+    def test_cleanup_stale_state(self):
+        upd = os.path.join(self.dir, wh.UPDATE_DIR_NAME)
+        os.makedirs(upd)
+        with open(os.path.join(upd, "partial.exe"), "wb") as fh:
+            fh.write(b"x")
+        with open(os.path.join(self.dir, "stray.tmp"), "w") as fh:
+            fh.write("x")
+        keep = os.path.join(self.dir, "keep.txt")
+        with open(keep, "w") as fh:
+            fh.write("x")
+        cleared = wh.cleanup_stale_state(base=self.dir)
+        self.assertEqual(len(cleared), 2)
+        self.assertFalse(os.listdir(upd))
+        self.assertTrue(os.path.exists(keep))
+        self.assertEqual(wh.cleanup_stale_state(base=self.dir),
+                         [])
+        events = self._events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["what"], "startup cleanup")
+        self.assertEqual(events[0]["result"], "repaired")
+
+    def test_discard_download(self):
+        path = os.path.join(self.dir, "bad.exe")
+        with open(path, "wb") as fh:
+            fh.write(b"x")
+        self.assertTrue(wh.discard_download(path))
+        self.assertFalse(os.path.exists(path))
+        self.assertTrue(wh.discard_download(path))
+        self.assertFalse(wh.discard_download(self.dir))
+
+    def test_repair_events_round_trip_and_cap(self):
+        path = os.path.join(self.dir, wh.REPAIR_EVENTS_FILE)
+        for i in range(wh.REPAIR_EVENTS_MAX + 5):
+            wh.record_repair_event("thing %d" % i, "repaired",
+                                   path=path)
+        events = wh.load_repair_events(path=path)
+        self.assertEqual(len(events), wh.REPAIR_EVENTS_MAX)
+        self.assertEqual(events[-1]["what"],
+                         "thing %d" % (wh.REPAIR_EVENTS_MAX + 4))
+
+    def test_gui_contract_self_repair(self):
+        src = open(os.path.join(os.path.dirname(__file__), "..",
+                                "windows_health.py"),
+                   encoding="utf-8").read()
+        self.assertIn("cleanup_stale_state()", src)
+        self.assertIn("Recent self-repairs", src)
 
 
 if __name__ == "__main__":

@@ -149,10 +149,22 @@ a separate v1.1.2):
 
 Tests: **131 unit + 56 self-test + 42 packaging**, all green
 (unit: 96 baseline + 13 updater + 10 crash + 12 self-repair;
-self-test +16 over the v1.1.0 suite's 40). CI run id and
-release asset size appended after the run, per the v1.1.0
-pattern. Real-Windows behavior (live update check/apply, a
-crash file landing in a real Downloads folder, GUI flows)
+self-test +16 over the v1.1.0 suite's 40). CI run
+**39091702648** (workflow_dispatch, release_tag=v1.1.1)
+**SUCCESS** — its gate re-ran unit tests + self-test from
+source, built the exe, smoke-tested it (`--version` prints
+1.1.1, `--self-test` passes on Windows), compiled the
+installer. Release **v1.1.1** published:
+WindowsHealthRepair-Setup.exe **14,089,090 B** (SHA-256
+b2d6044bdd39f52c31871eb072cb4e220f37e288a82ab850ada67fd13f320da5,
+served by GitHub as the asset digest — the hash the in-app
+updater verifies against) + WindowsHealthRepair.exe
+12,350,974 B. Drive copy updated IN PLACE (same file ID
+1dyC6B82FdFntVJVbQnFlXj3n9KoVtDe_, so Shawn's link is
+unchanged), size and MD5 verified against the release asset.
+Repo head after the v1.1.1 pushes: 0e8168b3 (this addendum's
+push follows). Real-Windows behavior (live update check/apply,
+a crash file landing in a real Downloads folder, GUI flows)
 remains **unverified** — no Windows machine here.
 
 ## v1.1.0 — troubleshooter + preventative scans (2026-10-17)

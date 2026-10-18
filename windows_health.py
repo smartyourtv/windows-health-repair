@@ -31,7 +31,7 @@ import sys
 import threading
 
 APP_NAME = "Windows Health & Repair"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 IS_WINDOWS = sys.platform.startswith("win")
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
@@ -39,6 +39,7 @@ CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 # Categories, in display order.
 CATEGORIES = [
     ("safety", "Safety snapshot (System Restore)"),
+    ("preventative", "Preventative check"),
     ("sysfiles", "System files (SFC / DISM)"),
     ("disk", "Disks & storage"),
     ("boot", "Boot performance"),
@@ -258,6 +259,26 @@ def parse_json_list(text):
     if isinstance(data, list):
         return [d for d in data if isinstance(d, dict)]
     return []
+
+
+def extract_json_text(text):
+    """Pull the JSON payload out of noisy command output.
+
+    v1.0.0 lesson (see docs/AUDITS.md): first-run PowerShell prints
+    module-load progress lines around ConvertTo-Json output, which
+    made strict json.loads fail and turned real Defender status into
+    one vague "could not read" row. This finds the outermost JSON
+    object/array span in the text; returns "" when there is none.
+    """
+    text = text or ""
+    starts = [i for i in (text.find("{"), text.find("[")) if i >= 0]
+    if not starts:
+        return ""
+    start = min(starts)
+    end = max(text.rfind("}"), text.rfind("]"))
+    if end <= start:
+        return ""
+    return text[start:end + 1]
 
 
 CODE_MANAGER_CODES = {
@@ -519,10 +540,13 @@ FIX_ORDER = {
     "registry_remove": 40,
     "firewall_enable": 45,
     "defender_rtp_enable": 46,
+    "service_start": 47,
     "startup_disable": 50,
     "exclusion_remove": 55,
     "cleanup_temp": 60,
     "cleanup_wu_cache": 61,
+    "dns_flush": 62,
+    "wu_reset": 63,
     "cache_rebuild": 70,
     "wsreset": 80,
     "net_reset": 90,
@@ -621,6 +645,7 @@ def parse_defender_status(text, now=None):
         "rtp": bool(d.get("RealTimeProtectionEnabled")),
         "ioav": bool(d.get("IoavProtectionEnabled")),
         "tamper": bool(d.get("IsTamperProtected")),
+        "sig_version": str(d.get("AntivirusSignatureVersion") or ""),
         "sig_age_days": sig_age,
         "sig_updated": sig_updated,
         "quick_scan_end": _parse_ms_date(d.get("QuickScanEndTime")),
@@ -722,6 +747,204 @@ def parse_service_states(text):
                 "display": d.get("DisplayName") or name,
             }
     return out
+
+
+# ----------------------------------------------------------------------
+# v1.1.0 parsers: network probes, audio, SMART prediction, WU pending
+# count, Defender summary — all pure, all fixture-tested.
+# ----------------------------------------------------------------------
+
+def parse_ping(text):
+    """Parse Windows `ping -n N host` output -> {sent, received, ok}.
+
+    Returns None when the output has no statistics block at all (the
+    command didn't really run / host unresolvable text only).
+    """
+    text = text or ""
+    m = re.search(r"Sent\s*=\s*(\d+).*?Received\s*=\s*(\d+)", text,
+                  re.IGNORECASE | re.DOTALL)
+    if not m:
+        if "reply from" in text.lower():
+            return {"sent": 1, "received": 1, "ok": True}
+        return None
+    sent, received = int(m.group(1)), int(m.group(2))
+    return {"sent": sent, "received": received, "ok": received > 0}
+
+
+def parse_nslookup(text):
+    """Parse nslookup output -> {ok, detail}.
+
+    Success = an answer section with an address for the queried name.
+    Failure text ("can't find", "timed out", "No response") wins over
+    the server header lines, which also contain 'Address:'.
+    """
+    text = text or ""
+    low = text.lower()
+    if "can't find" in low or "timed out" in low or \
+            "no response from server" in low or \
+            "server failed" in low:
+        for line in text.splitlines():
+            if line.strip():
+                return {"ok": False, "detail": line.strip()[:160]}
+        return {"ok": False, "detail": "DNS lookup failed"}
+    # The answer for the name comes after the "Name:" line (the server
+    # header above it also has an "Address:" line — ignore that one).
+    idx = low.find("name:")
+    if idx < 0:
+        return {"ok": False,
+                "detail": "no answer section in nslookup output"}
+    tail = text[idx:]
+    if re.search(r"address(?:es)?:\s*\S+", tail, re.IGNORECASE):
+        return {"ok": True, "detail": "name resolved to an address"}
+    return {"ok": False,
+            "detail": "no answer address in nslookup output"}
+
+
+def parse_net_adapters(text):
+    """Get-NetAdapter JSON -> [{name, status, link_speed, desc}]."""
+    out = []
+    for d in parse_json_list(extract_json_text(text) or text):
+        out.append({
+            "name": d.get("Name") or "Adapter",
+            "status": str(d.get("Status") or ""),
+            "link_speed": str(d.get("LinkSpeed") or ""),
+            "desc": d.get("InterfaceDescription") or "",
+        })
+    return out
+
+
+def parse_sound_devices(text):
+    """Win32_SoundDevice JSON -> [{name, status}]."""
+    out = []
+    for d in parse_json_list(extract_json_text(text) or text):
+        out.append({"name": d.get("Name") or "Sound device",
+                    "status": str(d.get("Status") or "")})
+    return out
+
+
+def parse_smart_predict(text):
+    """MSStorageDriver_FailurePredictStatus JSON -> [{instance, fail}].
+
+    None (not []) when the query produced nothing parseable — SMART
+    prediction is not exposed by every drive/controller, and "not
+    reported" must never be printed as "healthy".
+    """
+    rows = parse_json_list(extract_json_text(text) or text)
+    if not rows:
+        return None
+    out = []
+    for d in rows:
+        out.append({
+            "instance": str(d.get("InstanceName") or "drive"),
+            "predict_failure": bool(d.get("PredictFailure")),
+        })
+    return out
+
+
+def parse_wu_pending_count(text):
+    """WU Agent software-search JSON {"Count": n} -> int or None."""
+    rows = parse_json_list(extract_json_text(text) or text)
+    if not rows:
+        return None
+    try:
+        return int(rows[0].get("Count"))
+    except (TypeError, ValueError):
+        return None
+
+
+_HEX_CODE_RE = re.compile(r"0x[0-9a-fA-F]{8,10}")
+
+
+def _is_bugcheck_event(ev):
+    """BugCheck 1001 arrives under the provider name 'BugCheck' on
+    some builds and 'Microsoft-Windows-WER-SystemErrorReporting' on
+    others — accept both, never guess from the message alone."""
+    prov = (ev.get("ProviderName") or "").lower()
+    return int(ev.get("Id") or 0) == 1001 and (
+        "bugcheck" in prov or "systemerrorreporting" in prov)
+
+
+def bugcheck_codes(events):
+    """Raw events -> [(code, count)] from BugCheck event-1001 messages."""
+    counts = {}
+    for ev in events or []:
+        if not _is_bugcheck_event(ev):
+            continue
+        m = _HEX_CODE_RE.search(ev.get("Message") or "")
+        if m:
+            code = m.group(0).lower()
+            counts[code] = counts.get(code, 0) + 1
+    return sorted(counts.items(), key=lambda kv: -kv[1])
+
+
+def wu_error_codes(events):
+    """Raw events -> [(code, count)] from WindowsUpdateClient failures."""
+    counts = {}
+    for ev in events or []:
+        if "windowsupdateclient" not in \
+                (ev.get("ProviderName") or "").lower():
+            continue
+        if int(ev.get("Id") or 0) != 20:
+            continue
+        m = _HEX_CODE_RE.search(ev.get("Message") or "")
+        if m:
+            code = m.group(0).lower()
+            counts[code] = counts.get(code, 0) + 1
+    return sorted(counts.items(), key=lambda kv: -kv[1])
+
+
+def defender_summary_line(st, threat_count=None):
+    """One plain-language line summarizing Defender posture."""
+    if not st or not st.get("present"):
+        return ("Windows Security (Microsoft Defender): status could "
+                "not be read — see the Security section for why")
+    parts = ["real-time protection %s"
+             % ("ON" if st.get("rtp") else "OFF")]
+    if st.get("sig_version"):
+        parts.append("signatures v%s" % st["sig_version"])
+    age = st.get("sig_age_days")
+    if age is None:
+        parts.append("signature age unknown")
+    else:
+        parts.append("signatures %d day(s) old" % age)
+    if st.get("quick_scan_end"):
+        parts.append("last quick scan %s"
+                     % st["quick_scan_end"].strftime("%Y-%m-%d"))
+    else:
+        parts.append("no quick scan recorded")
+    if st.get("full_scan_end"):
+        parts.append("last full scan %s"
+                     % st["full_scan_end"].strftime("%Y-%m-%d"))
+    if threat_count is not None:
+        parts.append("%d threat detection(s) on record" % threat_count)
+    return "Windows Security (Microsoft Defender): " + "; ".join(parts)
+
+
+MALWAREBYTES_HOME = "https://www.malwarebytes.com"
+MALWAREBYTES_DOWNLOAD = ("https://www.malwarebytes.com/mwb-download/"
+                         "thankyou")
+MB_EXE_NAMES = ("mbam.exe", "Malwarebytes.exe")
+MB_STANDARD_PATHS = (
+    r"C:\Program Files\Malwarebytes\Anti-Malware\mbam.exe",
+    r"C:\Program Files (x86)\Malwarebytes\Anti-Malware\mbam.exe",
+)
+
+
+def find_malwarebytes_exe(entry, exists_fn=None):
+    """Locate the Malwarebytes exe: registry location first, then the
+    standard install paths (v1.0.0 only tried the registry location
+    and silently lost the launch button when that missed)."""
+    exists_fn = exists_fn or os.path.exists
+    loc = ((entry or {}).get("location") or "").strip()
+    candidates = []
+    if loc:
+        for name in MB_EXE_NAMES:
+            candidates.append(os.path.join(loc, name))
+    candidates.extend(MB_STANDARD_PATHS)
+    for p in candidates:
+        if p and exists_fn(p):
+            return p
+    return ""
 
 
 # ----------------------------------------------------------------------
@@ -1139,104 +1362,174 @@ def scan_update(log):
     return out
 
 
-def scan_security(log):
-    """Audit Defender / Firewall / SmartScreen — never a homemade AV."""
-    if not IS_WINDOWS:
-        return [needs_windows_finding("security", "Security posture scan")]
+DEFENDER_STATUS_PS = (
+    "Get-MpComputerStatus | Select-Object AMServiceEnabled, "
+    "AMRunningMode, AntivirusEnabled, RealTimeProtectionEnabled, "
+    "IoavProtectionEnabled, IsTamperProtected, "
+    "AntivirusSignatureLastUpdated, AntivirusSignatureAge, "
+    "AntivirusSignatureVersion, QuickScanEndTime, FullScanEndTime, "
+    "QuickScanNeeded, FullScanNeeded | ConvertTo-Json -Compress")
+
+
+def _defender_findings(status_txt, threat_txt):
+    """Findings from raw Defender outputs (pure given the texts).
+
+    v1.1.0 restructure (docs/AUDITS.md): the security scan used to be
+    one long function — any exception in it erased Defender status,
+    the fix offers AND the Malwarebytes card together, and on a
+    healthy PC almost no Defender action was offered at all. Now the
+    Defender part leads with a summary, always offers its actions,
+    and fails alone if it fails.
+    """
     out = []
-    ok, txt = ps_json(
-        "Get-MpComputerStatus | Select-Object AMServiceEnabled, "
-        "AMRunningMode, AntivirusEnabled, RealTimeProtectionEnabled, "
-        "IoavProtectionEnabled, IsTamperProtected, "
-        "AntivirusSignatureLastUpdated, AntivirusSignatureAge, "
-        "QuickScanEndTime, FullScanEndTime, QuickScanNeeded, "
-        "FullScanNeeded | ConvertTo-Json -Compress",
-        timeout=120, log=log)
-    st = parse_defender_status(txt) if ok else {"present": False}
+    st = parse_defender_status(extract_json_text(status_txt or "")
+                               or (status_txt or ""))
+    threats = parse_threat_detections(threat_txt) if threat_txt else []
+    out.append(Finding(
+        "security", defender_summary_line(
+            st, len(threats) if threat_txt else None),
+        detail="Live from Get-MpComputerStatus — this is the "
+               "antivirus built into Windows, driven by this app "
+               "where Windows allows it.",
+        severity="bad" if st.get("present") and not st.get("rtp")
+        else "info"))
     if not st.get("present"):
         out.append(Finding(
             "security", "Could not read Microsoft Defender status",
-            detail="The Defender status cmdlets did not answer. If a "
-                   "third-party antivirus is installed it may be managing "
-                   "protection instead.",
+            detail="The Defender status cmdlets did not answer with "
+                   "usable data. If a third-party antivirus is "
+                   "installed it may be managing protection instead.",
             why="Windows Security (Start → 'Windows Security') shows "
-                "which antivirus is in charge. Make sure SOMETHING is.",
+                "which antivirus is in charge. Make sure SOMETHING "
+                "is.",
+            severity="warn"))
+        return out
+    if not st["rtp"]:
+        out.append(Finding(
+            "security", "Defender real-time protection is OFF",
+            detail="Real-time protection is what stops malware as it "
+                   "runs, not just during scans.",
+            why="With real-time protection off, Defender only helps "
+                "during manual scans. Turn it back on.",
+            fix_label="Turn Defender real-time protection back on",
+            fix_kind="defender_rtp_enable", default_checked=True,
+            severity="bad"))
+    else:
+        out.append(Finding("security",
+                           "Defender real-time protection is on",
+                           severity="info"))
+    age = st["sig_age_days"]
+    if age is None:
+        out.append(Finding(
+            "security", "Antivirus signature age unknown",
+            detail="Defender did not report a signature date.",
+            severity="warn"))
+    elif age <= 2:
+        out.append(Finding(
+            "security", "Antivirus signatures are current "
+            "(%d day(s) old)" % age, severity="info"))
+    else:
+        sev = "bad" if age > 7 else "warn"
+        out.append(Finding(
+            "security", "Antivirus signatures are %d days old" % age,
+            detail="Last updated: %s" % st["sig_updated"],
+            why="Old signatures miss new malware. Updating them is "
+                "free and takes a minute.",
+            severity=sev))
+    # Signature update is ALWAYS offered in v1.1.0 — in v1.0.0 it was
+    # only offered when signatures were already stale, which is part
+    # of why the Defender tie-in looked absent on a healthy PC.
+    out.append(Finding(
+        "security", "Update Defender antivirus signatures",
+        detail="Asks Defender to fetch its latest malware "
+               "definitions now (MpCmdRun -SignatureUpdate).",
+        why="Signatures are how Defender recognizes new malware. "
+            "Updating on demand is safe and quick.",
+        fix_label="Update Defender signatures now",
+        fix_kind="defender_update", severity="info"))
+    if not st["tamper"]:
+        out.append(Finding(
+            "security", "Tamper Protection is off",
+            detail="Tamper Protection stops malware from quietly "
+                   "changing Defender's settings.",
+            why="It can only be switched on in the Windows Security "
+                "app (by design): Windows Security → Virus & threat "
+                "protection → Manage settings → Tamper Protection.",
             severity="warn"))
     else:
-        if not st["rtp"]:
-            out.append(Finding(
-                "security", "Defender real-time protection is OFF",
-                detail="Real-time protection is what stops malware as it "
-                       "runs, not just during scans.",
-                why="With real-time protection off, Defender only helps "
-                    "during manual scans. Turn it back on.",
-                fix_label="Turn Defender real-time protection back on",
-                fix_kind="defender_rtp_enable", default_checked=True,
-                severity="bad"))
-        else:
-            out.append(Finding("security",
-                               "Defender real-time protection is on",
-                               severity="info"))
-        age = st["sig_age_days"]
-        if age is None:
-            out.append(Finding(
-                "security", "Antivirus signature age unknown",
-                detail="Defender did not report a signature date.",
-                severity="warn"))
-        elif age <= 2:
-            out.append(Finding(
-                "security", "Antivirus signatures are current "
-                "(%d day(s) old)" % age, severity="info"))
-        else:
-            sev = "bad" if age > 7 else "warn"
-            out.append(Finding(
-                "security", "Antivirus signatures are %d days old" % age,
-                detail="Last updated: %s" % st["sig_updated"],
-                why="Old signatures miss new malware. Updating them is "
-                    "free and takes a minute.",
-                fix_label="Update Defender antivirus signatures now",
-                fix_kind="defender_update", default_checked=True,
-                severity=sev))
-        if not st["tamper"]:
-            out.append(Finding(
-                "security", "Tamper Protection is off",
-                detail="Tamper Protection stops malware from quietly "
-                       "changing Defender's settings.",
-                why="It can only be switched on in the Windows Security "
-                    "app (by design): Windows Security → Virus & threat "
-                    "protection → Manage settings → Tamper Protection.",
-                severity="warn"))
-        else:
-            out.append(Finding("security", "Tamper Protection is on",
-                               severity="info"))
-        last_quick = st["quick_scan_end"]
-        if st["quick_scan_needed"] or last_quick is None:
-            detail = ("Defender says a quick scan is needed."
-                      if st["quick_scan_needed"] else
-                      "No quick scan has been recorded on this PC.")
-            out.append(Finding("security", "A Defender quick scan is due",
-                               detail=detail, severity="warn"))
-        else:
-            out.append(Finding(
-                "security", "Last Defender quick scan: %s" % last_quick,
-                severity="info"))
-        # The one security ACTION: a quick scan, run by Defender itself.
+        out.append(Finding("security", "Tamper Protection is on",
+                           severity="info"))
+    last_quick = st["quick_scan_end"]
+    if st["quick_scan_needed"] or last_quick is None:
+        detail = ("Defender says a quick scan is needed."
+                  if st["quick_scan_needed"] else
+                  "No quick scan has been recorded on this PC.")
+        out.append(Finding("security", "A Defender quick scan is due",
+                           detail=detail, severity="warn"))
+    else:
         out.append(Finding(
-            "security", "Run a Defender Quick Scan",
-            detail="Defender does the scanning and makes all quarantine "
-                   "decisions — this app only starts it and reports "
-                   "what Defender found.",
-            why="A quick scan checks the places malware usually hides. "
-                "It is OFF by default here because it takes a few "
-                "minutes; tick it if you want it in this run.",
-            fix_label="Run Defender Quick Scan (results reported after)",
-            fix_kind="defender_scan", default_checked=False,
+            "security", "Last Defender quick scan: %s" % last_quick,
             severity="info"))
-    # Exclusions — a classic malware hiding trick.
-    ok, txt = ps_json(
-        "Get-MpPreference | Select-Object ExclusionPath, "
-        "ExclusionExtension, ExclusionProcess, ExclusionIpAddress | "
-        "ConvertTo-Json -Compress", timeout=120, log=log)
+    out.append(Finding(
+        "security", "Run a Defender Quick Scan",
+        detail="Defender does the scanning and makes all quarantine "
+               "decisions — this app only starts it and reports "
+               "what Defender found.",
+        why="A quick scan checks the places malware usually hides. "
+            "It is OFF by default here because it takes a few "
+            "minutes; tick it if you want it in this run.",
+        fix_label="Run Defender Quick Scan (results reported after)",
+        fix_kind="defender_scan", default_checked=False,
+        severity="info"))
+    out.append(Finding(
+        "security", "Open Windows Security",
+        detail="Opens Microsoft's own security app — protection "
+               "history, scan options, and the settings only it is "
+               "allowed to change (like Tamper Protection).",
+        payload={"open_target": "ms-windows-security:",
+                 "open_label": "Open Windows Security"},
+        severity="info"))
+    return out
+
+
+def _malwarebytes_finding(uninstall_entries):
+    """The Malwarebytes suggestion card — directly under the Defender
+    summary in v1.1.0, not buried at the end of the category."""
+    mb = find_malwarebytes(uninstall_entries)
+    if mb:
+        exe = find_malwarebytes_exe(mb)
+        return Finding(
+            "security", "Malwarebytes is installed (second-opinion "
+            "scanner)",
+            detail="A good second set of eyes alongside Defender. "
+                   "You can launch it from the button below." if exe
+                   else "Installed; launch it from the Start menu "
+                        "for a second-opinion scan.",
+            payload={"launch": exe} if exe else {},
+            severity="info")
+    return Finding(
+        "security", "Suggested: Malwarebytes (free second-opinion "
+        "scanner) — not installed",
+        detail="Malwarebytes Free is a respected second-opinion "
+               "scanner that works alongside Windows' built-in "
+               "Defender: Defender stays your always-on protection, "
+               "Malwarebytes is the extra pair of eyes you run when "
+               "something feels off. It can't be bundled with this "
+               "app (their license forbids redistributing the "
+               "installer, and a bundled copy would go stale "
+               "anyway) — the button below opens their OFFICIAL "
+               "download page so the installer comes straight from "
+               "them, current version, their terms.",
+        why="Two engines catch more than one, and this is the "
+            "second-opinion scanner this app recommends. Optional — "
+            "Defender alone is real protection; this is a bonus.",
+        payload={"url": MALWAREBYTES_DOWNLOAD,
+                 "url_label": "Get Malwarebytes Free (official site)"},
+        severity="info")
+
+
+def _exclusion_findings(ok, txt):
+    out = []
     exclusions = parse_defender_exclusions(txt) if ok else []
     if exclusions:
         for ex in exclusions:
@@ -1246,86 +1539,115 @@ def scan_security(log):
                 detail="Exclusions tell Defender to never scan "
                        "something. Legitimate for a few work tools — "
                        "but malware also hides this way.",
-                why="If you don't recognize this exclusion, remove it. "
-                    "You can always re-add it in Windows Security.",
+                why="If you don't recognize this exclusion, remove "
+                    "it. You can always re-add it in Windows "
+                    "Security.",
                 fix_label="Remove this Defender exclusion",
                 fix_kind="exclusion_remove", payload=dict(ex),
                 severity="warn"))
     elif ok:
-        out.append(Finding("security", "No Defender exclusions configured",
+        out.append(Finding("security",
+                           "No Defender exclusions configured",
                            detail="Nothing is exempt from scanning — "
                                   "the normal, safe state.",
                            severity="info"))
-    # Firewall profiles.
-    ok, txt = ps_json(
-        "Get-NetFirewallProfile | Select-Object Name, Enabled | "
-        "ConvertTo-Json -Compress", timeout=120, log=log)
+    return out
+
+
+def _firewall_findings(ok, txt):
+    out = []
     profiles = parse_firewall_profiles(txt) if ok else []
-    if profiles:
-        for p in profiles:
-            if p["enabled"]:
-                out.append(Finding(
-                    "security", "Firewall is ON for the %s profile"
-                    % p["name"], severity="info"))
-            else:
-                out.append(Finding(
-                    "security", "Firewall is OFF for the %s profile"
-                    % p["name"],
-                    detail="This profile applies to %s networks." %
-                    {"Domain": "domain", "Private": "home/work (private)",
-                     "Public": "public (coffee-shop/airport)"}.get(
-                         p["name"], "some"),
-                    why="The firewall is the front door lock. It should "
-                        "be on for every profile, above all Public.",
-                    fix_label="Turn the firewall ON for %s" % p["name"],
-                    fix_kind="firewall_enable",
-                    payload={"profile": p["name"]},
-                    default_checked=True, severity="bad"))
-    # SmartScreen (report-only).
-    ss = reg_get_value(ROOTS["HKLM"],
-                       r"SOFTWARE\Microsoft\Windows\CurrentVersion"
-                       r"\Explorer", "SmartScreenEnabled")
-    out.append(Finding(
-        "security", "SmartScreen (app & browser checks): %s"
-        % interpret_smartscreen(str(ss) if ss is not None else ""),
-        detail="SmartScreen checks downloaded apps and files against "
-               "Microsoft's reputation service. Report-only in this app — "
-               "change it in Windows Security → App & browser control.",
-        severity="warn" if (ss and str(ss).lower() == "off") else "info"))
-    # Malwarebytes: second-opinion scanner, detected — never bundled.
-    mb = find_malwarebytes(enum_uninstall_entries())
-    if mb:
-        exe = ""
-        loc = (mb.get("location") or "").strip()
-        for cand in ("Malwarebytes.exe", "mbam.exe"):
-            p = os.path.join(loc, cand) if loc else ""
-            if p and os.path.exists(p):
-                exe = p
-                break
-        out.append(Finding(
-            "security", "Malwarebytes is installed (second-opinion "
-            "scanner)",
-            detail="A good second set of eyes alongside Defender. You "
-                   "can launch it from the details button below." if exe
-                   else "Installed; launch it from the Start menu for a "
-                        "second-opinion scan.",
-            payload={"launch": exe} if exe else {},
-            severity="info"))
-    else:
-        out.append(Finding(
-            "security", "Malwarebytes is not installed",
-            detail="Optional, honest suggestion: Malwarebytes Free is "
-                   "a respected second-opinion scanner. It can't be "
-                   "bundled with this app (their license forbids "
-                   "redistributing the installer, and a bundled copy "
-                   "would go stale anyway) — the button below opens "
-                   "their official download page so the installer comes "
-                   "straight from them, current version, their terms.",
-            payload={"url": "https://www.malwarebytes.com/mwb-download/"
-                            "thankyou",
-                     "url_label": "Get Malwarebytes Free (official "
-                                  "site)"},
-            severity="info"))
+    for p in profiles:
+        if p["enabled"]:
+            out.append(Finding(
+                "security", "Firewall is ON for the %s profile"
+                % p["name"], severity="info"))
+        else:
+            out.append(Finding(
+                "security", "Firewall is OFF for the %s profile"
+                % p["name"],
+                detail="This profile applies to %s networks." %
+                {"Domain": "domain", "Private": "home/work (private)",
+                 "Public": "public (coffee-shop/airport)"}.get(
+                     p["name"], "some"),
+                why="The firewall is the front door lock. It should "
+                    "be on for every profile, above all Public.",
+                fix_label="Turn the firewall ON for %s" % p["name"],
+                fix_kind="firewall_enable",
+                payload={"profile": p["name"]},
+                default_checked=True, severity="bad"))
+    return out
+
+
+def scan_security(log):
+    """Audit Defender / Firewall / SmartScreen — never a homemade AV.
+
+    Each part is isolated: a failure in one part degrades that part
+    only (v1.0.0 lost the whole category to any single exception).
+    """
+    if not IS_WINDOWS:
+        return [needs_windows_finding("security",
+                                      "Security posture scan")]
+    out = []
+
+    def _part(label, fn):
+        try:
+            out.extend(fn())
+        except Exception as exc:
+            log("Security part %s raised: %r" % (label, exc))
+            out.append(Finding(
+                "security", "Security check part failed: %s" % label,
+                detail="The failure was recorded in the log (%s). "
+                       "The other security checks are unaffected."
+                       % exc, severity="warn"))
+
+    def _defender():
+        ok, txt = ps_json(DEFENDER_STATUS_PS, timeout=120, log=log)
+        ok2, ttxt = ps_json(
+            "Get-MpThreatDetection | Select-Object ThreatID, "
+            "InitialDetectionTime, ThreatStatusID, Resources | "
+            "ConvertTo-Json -Compress", timeout=120, log=log)
+        return _defender_findings(txt if ok else "",
+                                  ttxt if ok2 else None)
+
+    _part("Defender status", _defender)
+    # The Malwarebytes card sits directly under the Defender summary.
+    _part("Malwarebytes",
+          lambda: [_malwarebytes_finding(enum_uninstall_entries())])
+
+    def _exclusions():
+        ok, txt = ps_json(
+            "Get-MpPreference | Select-Object ExclusionPath, "
+            "ExclusionExtension, ExclusionProcess, ExclusionIpAddress"
+            " | ConvertTo-Json -Compress", timeout=120, log=log)
+        return _exclusion_findings(ok, txt)
+
+    _part("Defender exclusions", _exclusions)
+
+    def _firewall():
+        ok, txt = ps_json(
+            "Get-NetFirewallProfile | Select-Object Name, Enabled | "
+            "ConvertTo-Json -Compress", timeout=120, log=log)
+        return _firewall_findings(ok, txt)
+
+    _part("Firewall", _firewall)
+
+    def _smartscreen():
+        ss = reg_get_value(ROOTS["HKLM"],
+                           r"SOFTWARE\Microsoft\Windows\CurrentVersion"
+                           r"\Explorer", "SmartScreenEnabled")
+        return [Finding(
+            "security", "SmartScreen (app & browser checks): %s"
+            % interpret_smartscreen(str(ss) if ss is not None
+                                    else ""),
+            detail="SmartScreen checks downloaded apps and files "
+                   "against Microsoft's reputation service. "
+                   "Report-only in this app — change it in Windows "
+                   "Security → App & browser control.",
+            severity="warn" if (ss and str(ss).lower() == "off")
+            else "info")]
+
+    _part("SmartScreen", _smartscreen)
     return out
 
 
@@ -2122,6 +2444,92 @@ def fix_defender_scan(step, log):
                   % len(detections))
 
 
+def wu_cache_backup_name(when=None):
+    """Name of the renamed-as-backup WU download cache folder."""
+    when = when or datetime.datetime.now()
+    return "Download.bak-%s" % when.strftime("%Y%m%d-%H%M%S")
+
+
+def write_service_backup(record, dest_dir=None):
+    """Persist a service's pre-change state (start type) as JSON in
+    the backups folder. Returns the file path. Pure file write —
+    unit-tested."""
+    dest_dir = dest_dir or backup_dir()
+    os.makedirs(dest_dir, exist_ok=True)
+    safe = re.sub(r"[^\w.-]+", "_", record.get("name") or "service")
+    path = os.path.join(dest_dir, "service-%s.json" % safe)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(record, fh, indent=1)
+    return path
+
+
+def fix_service_start(step, log):
+    """Set a stopped/disabled service back to Manual and start it.
+
+    Backup: the previous start type is written to backups/ as JSON
+    before anything changes. Verify (verify_step) re-reads the
+    service state afterwards.
+    """
+    name = step.payload.get("name") or ""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        return False, "refusing: service name looks wrong (%s)" % name
+    ok, txt = ps_json(
+        "Get-Service '%s' -ErrorAction SilentlyContinue | "
+        "Select-Object Name, Status, StartType | ConvertTo-Json "
+        "-Compress" % name, timeout=60, log=log)
+    before = parse_service_states(txt).get(name.lower()) if ok else None
+    if before is None:
+        return False, "service %s not found on this PC" % name
+    backup_path = write_service_backup({
+        "name": name, "status_before": before["status"],
+        "start_type_before": before["start_type"],
+        "when": now_stamp()})
+    log("Service pre-change state saved: %s" % backup_path)
+    safe = name.replace("'", "''")
+    rc, out = run_ps(
+        "Set-Service '%s' -StartupType Manual; Start-Service '%s' "
+        "-ErrorAction SilentlyContinue" % (safe, safe),
+        timeout=120, log=log)
+    if rc != 0:
+        return False, ("could not start %s: %s (previous start type "
+                       "is recorded in %s)"
+                       % (name, out.strip()[:200], backup_path))
+    return True, ("%s set to Manual and started (was: %s / %s; "
+                  "previous state saved to %s)"
+                  % (name, before["status"], before["start_type"],
+                     backup_path))
+
+
+def fix_wu_reset(step, log):
+    """Windows Update cache reset WITH backup: the download cache
+    folder is renamed (not deleted), services stopped/started around
+    it. The renamed folder is the undo path and is named in the
+    result message."""
+    windir = os.environ.get("SystemRoot") or r"C:\Windows"
+    base = os.path.join(windir, "SoftwareDistribution")
+    src = os.path.join(base, "Download")
+    bak_name = wu_cache_backup_name()
+    dest = os.path.join(base, bak_name)
+    run_cmd(["net", "stop", "wuauserv"], timeout=120, log=log)
+    run_cmd(["net", "stop", "bits"], timeout=120, log=log)
+    try:
+        if os.path.isdir(src):
+            os.rename(src, dest)
+            os.makedirs(src, exist_ok=True)
+            msg = ("update download cache reset — the old cache was "
+                   "renamed to %s (that folder IS the backup; delete "
+                   "it in a few days once updates work, or rename it "
+                   "back to undo)" % dest)
+        else:
+            os.makedirs(src, exist_ok=True)
+            msg = ("update download cache reset — no existing cache "
+                   "folder was found, a fresh one was created")
+    finally:
+        run_cmd(["net", "start", "bits"], timeout=120, log=log)
+        run_cmd(["net", "start", "wuauserv"], timeout=120, log=log)
+    return True, msg
+
+
 def run_fix_step(step, log):
     """Execute one fix step -> (ok, message). Restore point handled by
     the plan runner, not here."""
@@ -2290,6 +2698,19 @@ def run_fix_step(step, log):
             except subprocess.TimeoutExpired:
                 pass
             return True, "Store cache reset launched (wsreset)"
+        if kind == "dns_flush":
+            rc, out = run_cmd(["ipconfig", "/flushdns"], timeout=60,
+                              log=log)
+            if rc == 0:
+                return True, ("DNS cache flushed (nothing to back "
+                              "up: the cache is transient and Windows "
+                              "re-learns addresses automatically)")
+            return False, "ipconfig /flushdns failed: %s" \
+                % out.strip()[:200]
+        if kind == "service_start":
+            return fix_service_start(step, log)
+        if kind == "wu_reset":
+            return fix_wu_reset(step, log)
         if kind == "memdiag":
             subprocess.Popen(["mdsched.exe"])
             return True, "Windows Memory Diagnostic opened — choose " \
@@ -2345,6 +2766,52 @@ def verify_step(step, log):
             return "verify: exclusion %s" % (
                 "still present" if step.payload.get("value") in values
                 else "gone")
+        if step.kind == "service_start":
+            name = (step.payload.get("name") or "").lower()
+            ok, txt = ps_json(
+                "Get-Service | Select-Object Name, DisplayName, "
+                "Status, StartType | ConvertTo-Json -Compress",
+                timeout=60, log=log)
+            states = parse_service_states(txt) if ok else {}
+            svc = states.get(name)
+            if svc:
+                return "verify: %s is now %s (%s)" % (
+                    step.payload.get("name"), svc["status"],
+                    svc["start_type"])
+            return "verify: could not re-read the service state"
+        if step.kind == "dns_flush":
+            rc, out = run_cmd(["nslookup", "www.microsoft.com"],
+                              timeout=60, log=log)
+            res = parse_nslookup(out)
+            return "verify: DNS lookup %s (%s)" % (
+                "works" if res["ok"] else "still failing",
+                res["detail"])
+        if step.kind == "wu_reset":
+            ok, txt = ps_json(
+                "Get-Service wuauserv,bits -ErrorAction "
+                "SilentlyContinue | Select-Object Name, DisplayName, "
+                "Status, StartType | ConvertTo-Json -Compress",
+                timeout=60, log=log)
+            states = parse_service_states(txt) if ok else {}
+            bits = []
+            for nm in ("wuauserv", "bits"):
+                svc = states.get(nm)
+                bits.append("%s %s" % (nm, svc["status"] if svc
+                                       else "not found"))
+            return "verify: update services after reset — %s" \
+                % ", ".join(bits)
+        if step.kind == "defender_update":
+            ok, txt = ps_json(
+                "Get-MpComputerStatus | Select-Object "
+                "AntivirusSignatureAge, AntivirusSignatureVersion | "
+                "ConvertTo-Json -Compress", timeout=60, log=log)
+            rows = parse_json_list(extract_json_text(txt)) if ok \
+                else []
+            if rows:
+                return "verify: signatures now v%s, %s day(s) old" % (
+                    rows[0].get("AntivirusSignatureVersion") or "?",
+                    rows[0].get("AntivirusSignatureAge"))
+            return "verify: could not re-read the signature state"
     except Exception:
         return None
     return None
@@ -2591,6 +3058,95 @@ def run_self_test():
           .startswith("Better"))
     check("driver backup dest is timestamped",
           "drivers-" in driver_backup_dest(base="/tmp/x"))
+    # --- v1.1.0: troubleshooter / preventative / new parsers --------
+    check("noisy JSON is extracted",
+          parse_defender_status(extract_json_text(
+              "Preparing modules...\n{\"AMServiceEnabled\":true,"
+              "\"AntivirusEnabled\":true,"
+              "\"RealTimeProtectionEnabled\":true,"
+              "\"IsTamperProtected\":true,"
+              "\"AntivirusSignatureAge\":0}"))["rtp"] is True)
+    check("nslookup parse",
+          parse_nslookup("Server: dns\nAddress: 1.1.1.1\n\n"
+                         "Name: www.microsoft.com\n"
+                         "Address: 20.0.0.1")["ok"]
+          and not parse_nslookup("*** dns can't find x: "
+                                 "Server failed")["ok"])
+    check("ping parse",
+          parse_ping("Packets: Sent = 2, Received = 2, Lost = 0")
+          ["ok"] and parse_ping("Packets: Sent = 2, Received = 0")
+          ["ok"] is False)
+    check("smart predict parse",
+          parse_smart_predict(
+              '[{"InstanceName":"SCSI\\\\Disk0",'
+              '"PredictFailure":true}]')[0]["predict_failure"]
+          and parse_smart_predict("") is None)
+    check("wu pending count parse",
+          parse_wu_pending_count('{"Count": 7}') == 7
+          and parse_wu_pending_count("") is None)
+    check("defender summary line",
+          defender_summary_line(parse_defender_status(
+              '{"AMServiceEnabled":true,"AntivirusEnabled":true,'
+              '"RealTimeProtectionEnabled":true,'
+              '"AntivirusSignatureVersion":"1.2.3",'
+              '"AntivirusSignatureAge":1}'), 0)
+          .startswith("Windows Security (Microsoft Defender): "
+                      "real-time protection ON"))
+
+    class _FakeEnv:
+        def startup_items(self):
+            return {"total": 3, "missing": [], "console": []}
+
+        def boot(self):
+            return {"latest_boot": {"total_ms": 30000,
+                                    "time": "2026-10-17"},
+                    "offenders": []}
+
+        def junk_sizes(self):
+            return {}
+
+        def volumes(self):
+            return [{"DriveLetter": "C", "Size": 100,
+                     "SizeRemaining": 50}]
+
+        def disk_health(self):
+            return [{"FriendlyName": "D", "HealthStatus": "Healthy"}]
+
+    ts_out = run_troubleshooter("slow_startup", _FakeEnv())
+    check("troubleshooter not_found is honest",
+          ts_out["outcome"] == "not_found"
+          and len(ts_out["checks"]) == 6
+          and ts_out["next_steps"])
+
+    class _SmartEnv(_FakeEnv):
+        def smart_predict(self):
+            return [{"instance": "Disk0", "predict_failure": True}]
+
+        def events(self, days, provider_like=None):
+            return []
+
+    ts_out2 = run_troubleshooter("disk", _SmartEnv())
+    check("troubleshooter guided outcome for SMART",
+          ts_out2["outcome"] == "guided"
+          and ts_out2["cause"]["guide"])
+    _GB = 1024 ** 3
+    p_issues, p_changes = evaluate_preventative(
+        {"volumes": [{"DriveLetter": "C", "Size": 500 * _GB,
+                      "SizeRemaining": 10 * _GB}],
+         "defender": {"present": True, "rtp": False,
+                      "sig_age_days": 1},
+         "firewall": [{"name": "Public", "enabled": False}],
+         "pending_updates": 2, "startup_names": ["A"],
+         "restore_point_age_days": 2.0},
+        {"volumes": [{"DriveLetter": "C", "Size": 500 * _GB,
+                      "SizeRemaining": 200 * _GB}],
+         "startup_names": []})
+    check("preventative evaluation",
+          any(i["key"] == "defender-rtp" for i in p_issues)
+          and any("free space dropped" in c for c in p_changes))
+    check("auto-check schedule args",
+          "WEEKLY" in auto_check_schtasks_args("weekly", "x")
+          and "MONTHLY" in auto_check_schtasks_args("monthly", "x"))
 
     print("%s %s — self-test" % (APP_NAME, APP_VERSION))
     print("Platform: %s | Windows: %s | Admin: %s | Python: %s"
@@ -2676,12 +3232,29 @@ def launch_gui():
 
     btns2 = tk.Frame(root, bg=bg)
     btns2.pack(fill="x", padx=16, pady=(0, 2))
-    monthly_btn = tk.Button(btns2, text="Monthly auto-check",
+    monthly_btn = tk.Button(btns2, text="Auto-check on/off",
                             padx=12, pady=4)
     monthly_btn.pack(side="left")
+    mode_btn = tk.Button(btns2, text="Auto-check: Monthly",
+                         padx=12, pady=4)
+    mode_btn.pack(side="left", padx=4)
     monthly_var = tk.StringVar()
     tk.Label(btns2, textvariable=monthly_var, bg=bg, fg="#9aa3b2",
              font=("Sans", 9)).pack(side="left", padx=10)
+
+    btns3 = tk.Frame(root, bg=bg)
+    btns3.pack(fill="x", padx=16, pady=(0, 2))
+    ts_btn = tk.Button(btns3, text="Troubleshoot a problem…",
+                       padx=12, pady=4, font=("Sans", 10, "bold"))
+    ts_btn.pack(side="left")
+    prev_btn = tk.Button(btns3, text="Preventative scan",
+                         padx=12, pady=4)
+    prev_btn.pack(side="left", padx=8)
+    tk.Label(btns3, text="Troubleshooter: pick a problem, the app "
+                          "checks step by step and either fixes it "
+                          "safely or explains how.",
+             bg=bg, fg="#9aa3b2", font=("Sans", 9)).pack(side="left",
+                                                         padx=6)
 
     progress = ttk.Progressbar(root, mode="determinate")
     progress.pack(fill="x", padx=16, pady=(2, 2))
@@ -2808,6 +3381,26 @@ def launch_gui():
                       text="Open Windows' uninstall page",
                       command=_uninstall, padx=12,
                       pady=4).pack(side="left")
+        target = (f.payload or {}).get("open_target")
+        if target:
+            label = (f.payload or {}).get("open_label", "Open")
+
+            def _open(t=target):
+                if IS_WINDOWS:
+                    os.startfile(t)  # noqa: S606 - our own URI
+                else:
+                    messagebox.showinfo(
+                        label, "On Windows this opens: %s" % t)
+            tk.Button(action_frame, text=label, command=_open,
+                      padx=12, pady=4).pack(side="left")
+        area = (f.payload or {}).get("ts_area")
+        if not area and f.severity in ("warn", "bad"):
+            area = TS_AREA_FOR_CATEGORY.get(f.category)
+        if area:
+            tk.Button(
+                action_frame, text="Troubleshoot this",
+                command=lambda a=area: open_troubleshooter(a),
+                padx=12, pady=4).pack(side="left")
 
     def on_tree_click(event):
         rid = tree.identify_row(event.y)
@@ -2970,32 +3563,322 @@ def launch_gui():
 
     def refresh_monthly():
         on = monthly_task_registered()
+        mode = auto_check_mode()
+        mode_btn.configure(text="Auto-check: %s"
+                           % ("Weekly" if mode == "weekly"
+                              else "Monthly"))
         first = monthly_status_text().splitlines()
-        monthly_var.set("Monthly auto-check: %s. %s"
-                        % ("ON (1st of the month, scan only)"
-                           if on else "OFF",
+        monthly_var.set("Auto-check: %s (%s, scan only). %s"
+                        % ("ON" if on else "OFF",
+                           "Mondays" if mode == "weekly"
+                           else "1st of the month",
                            first[0] if first else ""))
 
     def do_monthly():
+        mode = auto_check_mode()
         if monthly_task_registered():
             if not messagebox.askyesno(
-                    "Turn OFF monthly auto-check?",
-                    "The scheduled monthly scan-only check will be "
-                    "removed. Nothing else changes."):
+                    "Turn OFF the auto-check?",
+                    "The scheduled scan-only check will be removed. "
+                    "Nothing else changes."):
                 return
             ok, msg = monthly_unregister()
         else:
             if not messagebox.askyesno(
-                    "Turn ON monthly auto-check?",
-                    "Once a month (1st, ~09:00) this app will run a "
+                    "Turn ON the auto-check?",
+                    "On a schedule (%s, ~09:00) this app will run a "
                     "SCAN-ONLY check in the background — it never "
                     "fixes anything on its own — and save the report "
-                    "next to the app, so you can see whether the PC "
-                    "is getting better or worse over time."):
+                    "next to the app, including a preventative "
+                    "'what changed' summary, so you can see whether "
+                    "the PC is getting better or worse over time."
+                    % ("every Monday" if mode == "weekly"
+                       else "the 1st of each month")):
                 return
             ok, msg = monthly_register()
-        messagebox.showinfo("Monthly auto-check", msg)
+        messagebox.showinfo("Auto-check", msg)
         refresh_monthly()
+
+    def do_mode():
+        mode = "monthly" if auto_check_mode() == "weekly" \
+            else "weekly"
+        save_auto_check_mode(mode)
+        if monthly_task_registered():
+            ok, msg = monthly_register()
+            messagebox.showinfo(
+                "Auto-check schedule",
+                "Schedule set to %s. %s" % (mode, msg))
+        else:
+            messagebox.showinfo(
+                "Auto-check schedule",
+                "Schedule set to %s — it takes effect when you "
+                "turn the auto-check on." % mode)
+        refresh_monthly()
+
+    def do_preventative():
+        if state["busy"]:
+            return
+        if not IS_WINDOWS:
+            messagebox.showinfo(
+                "Preventative scan",
+                "The preventative scan measures a real Windows PC "
+                "(disk health, Defender, updates…). On this "
+                "machine every measurement honestly needs Windows.")
+            return
+        set_busy(True, "Running the preventative scan…")
+
+        def worker():
+            plog = RunLog(sink=lambda line: log_queue.put(line))
+            plog.start_file()
+            try:
+                data = gather_preventative(plog)
+                prev = record_preventative(data)
+                findings, changes, attention = \
+                    build_preventative_findings(data, prev)
+            except Exception as exc:
+                plog("Preventative scan failed: %r" % (exc,))
+                root.after(0, lambda: (
+                    set_busy(False),
+                    messagebox.showerror(
+                        "Preventative scan",
+                        "It could not run: %s" % exc)))
+                return
+
+            def done():
+                populate(findings)
+                set_busy(False)
+                if attention:
+                    status_var.set(
+                        "Preventative scan complete — %d item(s) "
+                        "need attention. Click one and use "
+                        "'Troubleshoot this' for a step-by-step "
+                        "diagnosis." % attention)
+                else:
+                    status_var.set(
+                        "Preventative scan complete — nothing "
+                        "needs attention.")
+            root.after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def open_troubleshooter(preselect=None):
+        win = tk.Toplevel(root)
+        win.title("Troubleshoot a problem — %s" % APP_NAME)
+        win.geometry("880x640")
+        win.minsize(760, 520)
+        win.resizable(True, True)
+        win.configure(bg=bg)
+        tk.Label(win, text="What is the problem?", bg=bg, fg=fg,
+                 font=("Sans", 13, "bold")).pack(fill="x", padx=14,
+                                                  pady=(10, 2))
+        tk.Label(win, bg=bg, fg="#9aa3b2", font=("Sans", 9),
+                 wraplength=840, justify="left",
+                 text="Pick a problem area. The app runs real "
+                      "checks in order — cheap ones first — and "
+                      "shows the evidence as it goes. It ends one "
+                      "of three ways: a cause it can fix safely "
+                      "(behind a restore point, verified after), a "
+                      "cause with a step-by-step guide, or an "
+                      "honest 'not found' with what was ruled out."
+                 ).pack(fill="x", padx=14)
+        area_var = tk.StringVar()
+        area_titles = [TROUBLESHOOT_FLOWS[a]["title"]
+                       for a in TROUBLESHOOT_FLOWS]
+        area_ids = list(TROUBLESHOOT_FLOWS)
+        combo = ttk.Combobox(win, textvariable=area_var,
+                             values=area_titles, state="readonly",
+                             width=52)
+        combo.pack(fill="x", padx=14, pady=6)
+        if preselect in TROUBLESHOOT_FLOWS:
+            combo.current(area_ids.index(preselect))
+        elif area_titles:
+            combo.current(0)
+        run_btn = tk.Button(win, text="Run the checks", padx=16,
+                            pady=5, font=("Sans", 11, "bold"))
+        run_btn.pack(padx=14, anchor="w")
+        out_box = scrolledtext.ScrolledText(
+            win, bg="#0b0d12", fg="#cfd6e4", font=("Monospace", 9),
+            state="disabled")
+        out_box.pack(fill="both", expand=True, padx=14, pady=8)
+        act = tk.Frame(win, bg=bg)
+        act.pack(fill="x", padx=14, pady=(0, 10))
+        ts_state = {"outcome": None, "busy": False}
+
+        def show(text):
+            out_box.configure(state="normal")
+            out_box.delete("1.0", "end")
+            out_box.insert("1.0", text)
+            out_box.configure(state="disabled")
+
+        def add(text):
+            out_box.configure(state="normal")
+            out_box.insert("end", text)
+            out_box.see("end")
+            out_box.configure(state="disabled")
+
+        def render_outcome(outcome):
+            for child in act.winfo_children():
+                child.destroy()
+            lines = ["", "=" * 60]
+            oc = outcome["outcome"]
+            cause = outcome.get("cause") or {}
+            if oc == "fixable":
+                lines.append("CAUSE FOUND — and it can be fixed "
+                             "safely:")
+                lines.append("  %s" % cause["title"])
+                lines.append("  %s" % cause["explanation"])
+                lines.append("")
+                lines.append("The fix runs ONLY if you press the "
+                             "button below. A restore point is "
+                             "created first (hard rule — if that "
+                             "fails, nothing runs), and afterwards "
+                             "the failing check is re-run to verify "
+                             "the result honestly.")
+
+                def do_apply():
+                    if IS_WINDOWS and not is_admin():
+                        messagebox.showwarning(
+                            "Admin needed",
+                            "Fixes need administrator rights. "
+                            "Close this window and use 'Relaunch "
+                            "as admin' in the main window, then "
+                            "come back.", parent=win)
+                        return
+                    if not messagebox.askyesno(
+                            "Run this fix?",
+                            "A restore point is created FIRST. If "
+                            "that fails, nothing runs. Re-check "
+                            "afterwards is automatic.",
+                            parent=win):
+                        return
+                    ts_state["busy"] = True
+                    run_btn.configure(state="disabled")
+                    tlog = RunLog(
+                        sink=lambda line: log_queue.put(line))
+                    tlog.start_file()
+                    plan = build_fix_plan(
+                        cause_to_findings(outcome))
+
+                    def fix_worker():
+                        results = execute_plan(plan, tlog)
+                        env = WindowsProbes(tlog)
+                        passed, evidence = verify_troubleshoot(
+                            outcome, env)
+                        ok_n = sum(1 for r in results if r[1])
+
+                        def finish():
+                            ts_state["busy"] = False
+                            run_btn.configure(state="normal")
+                            add("\nFix run: %d/%d steps OK.\n"
+                                % (ok_n, len(results)))
+                            if passed is None:
+                                add("Re-check: %s\n" % evidence)
+                            elif passed:
+                                add("Re-check after the fix: "
+                                    "PASSED — the failing check "
+                                    "now reports: %s\n" % evidence)
+                            else:
+                                add("Re-check after the fix: "
+                                    "STILL FAILING — the check "
+                                    "reports: %s\nThe fix ran, but "
+                                    "the problem is still there; "
+                                    "the guide in the main report "
+                                    "is the next step.\n"
+                                    % evidence)
+                        root.after(0, finish)
+
+                    threading.Thread(target=fix_worker,
+                                     daemon=True).start()
+
+                tk.Button(act, text="Fix it (restore point first)",
+                          command=do_apply, padx=14, pady=5,
+                          font=("Sans", 10, "bold")).pack(
+                              side="left")
+            elif oc == "guided":
+                lines.append("CAUSE FOUND — this one is bigger than "
+                             "a safe automatic fix:")
+                lines.append("  %s" % cause["title"])
+                lines.append("  %s" % cause["explanation"])
+                lines.append("")
+                lines.append("Step by step:")
+                for i, step in enumerate(cause.get("guide") or [],
+                                         1):
+                    lines.append("  %d. %s" % (i, step))
+                guide_text = "\n".join(lines)
+
+                def copy_guide(t=guide_text):
+                    win.clipboard_clear()
+                    win.clipboard_append(t)
+                    messagebox.showinfo(
+                        "Copied",
+                        "The guide is on the clipboard — paste it "
+                        "into any document to print or keep it.",
+                        parent=win)
+
+                tk.Button(act, text="Copy the guide",
+                          command=copy_guide, padx=14,
+                          pady=5).pack(side="left")
+            else:
+                lines.append("CAUSE NOT FOUND — honestly. The "
+                             "checks above all ran; here is what "
+                             "they ruled out:")
+                for r in outcome["checks"]:
+                    mark = {"pass": "ruled out", "info": "noted",
+                            "unknown": "could not check",
+                            "fail": "symptom seen"}.get(
+                                r["status"], r["status"])
+                    lines.append("  - %s (%s): %s"
+                                 % (r["title"], mark,
+                                    r["evidence"]))
+                lines.append("")
+                lines.append("Next steps to try yourself:")
+                for i, step in enumerate(outcome["next_steps"], 1):
+                    lines.append("  %d. %s" % (i, step))
+            show("\n".join(lines))
+
+        def do_run():
+            if ts_state["busy"]:
+                return
+            idx = combo.current()
+            if idx < 0:
+                return
+            area = area_ids[idx]
+            ts_state["busy"] = True
+            run_btn.configure(state="disabled")
+            for child in act.winfo_children():
+                child.destroy()
+            tlog = RunLog(sink=lambda line: log_queue.put(line))
+            tlog.start_file()
+            tlog("Troubleshooter started: %s (log: %s)"
+                 % (TROUBLESHOOT_FLOWS[area]["title"], tlog.path))
+            show("Running checks for: %s\n"
+                 % TROUBLESHOOT_FLOWS[area]["title"])
+
+            def worker():
+                env = WindowsProbes(tlog)
+                outcome = run_troubleshooter(area, env, log=tlog)
+                ts_state["outcome"] = outcome
+
+                def done():
+                    ts_state["busy"] = False
+                    run_btn.configure(state="normal")
+                    head = []
+                    for r in outcome["checks"]:
+                        mark = {"pass": "PASS", "fail": "FAIL",
+                                "info": "INFO",
+                                "unknown": "?"}[r["status"]]
+                        head.append("[%s] %s\n      %s"
+                                    % (mark, r["title"],
+                                       r["evidence"]))
+                    show("\n".join(head))
+                    render_outcome(outcome)
+                root.after(0, done)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        run_btn.configure(command=do_run)
+        if preselect:
+            do_run()
 
     scan_btn.configure(command=do_scan)
     fix_btn.configure(command=do_fix)
@@ -3004,6 +3887,9 @@ def launch_gui():
     log_btn.configure(command=do_logs)
     cert_btn.configure(command=do_certificate)
     monthly_btn.configure(command=do_monthly)
+    mode_btn.configure(command=do_mode)
+    ts_btn.configure(command=lambda: open_troubleshooter())
+    prev_btn.configure(command=do_preventative)
     refresh_monthly()
 
     if IS_WINDOWS and is_admin():
@@ -3594,7 +4480,12 @@ def monthly_task_registered():
 
 
 def monthly_register():
-    """Register the monthly Task Scheduler job (Windows only)."""
+    """Register the auto-check Task Scheduler job (Windows only).
+
+    The task keeps its v1.0.0 name (renaming would orphan the old
+    task on user PCs); the trigger follows the saved mode — weekly
+    (Mondays) or monthly (the 1st, the default).
+    """
     if not IS_WINDOWS:
         return False, "Task Scheduler registration needs Windows."
     if is_frozen():
@@ -3603,14 +4494,15 @@ def monthly_register():
     else:
         script = os.path.abspath(sys.argv[0])
         action = '"%s" "%s" --scan-only' % (sys.executable, script)
-    rc, out = run_cmd(["schtasks", "/Create", "/TN",
-                       MONTHLY_TASK_NAME, "/TR", action,
-                       "/SC", "MONTHLY", "/D", "1", "/ST", "09:00",
-                       "/F"])
+    mode = auto_check_mode()
+    rc, out = run_cmd(["schtasks"] + auto_check_schtasks_args(
+        mode, action))
     if rc == 0:
-        return True, ("monthly auto-check registered: runs on the "
-                      "1st at ~09:00, scan-only, report saved next "
-                      "to the app")
+        when = "every Monday" if mode == "weekly" else \
+            "on the 1st of the month"
+        return True, ("auto-check registered: runs %s at ~09:00, "
+                      "scan-only, report saved next to the app"
+                      % when)
     return False, "schtasks failed: %s" % out.strip()[:200]
 
 
@@ -3639,18 +4531,45 @@ def cmd_scan_only():
     log = RunLog()
     log_path = log.start_file()
     if not IS_WINDOWS:
-        log("Monthly auto-check: this machine is not Windows — "
+        log("Auto-check: this machine is not Windows — "
             "nothing scanned, nothing faked.")
         print("scan-only needs Windows; log at %s" % log_path)
         return 2
-    log("Monthly auto-check (scan-only — no fixes are ever run "
-        "headless).")
+    log("Auto-check (scan-only — no fixes are ever run headless). "
+        "Schedule mode: %s." % auto_check_mode())
     findings = run_scan(log)
     summary = summarize_findings(findings)
     prev = record_history(summary)
     comparison = diff_summaries(prev, summary)
     report = build_report(findings, [])
     report += "\n\n== Auto-check history ==\n%s\n" % comparison
+    # Preventative measurements + "what changed" (v1.1.0).
+    pdata = None
+    attention = 0
+    try:
+        pdata = gather_preventative(log)
+    except Exception as exc:
+        log("Preventative gather raised: %r" % (exc,))
+    if pdata is not None:
+        p_prev = record_preventative(pdata)
+        p_findings, p_changes, attention = \
+            build_preventative_findings(pdata, p_prev)
+        report += "\n== Preventative check ==\n"
+        if p_changes:
+            report += "What changed since last time:\n"
+            for line in p_changes:
+                report += "  - %s\n" % line
+        else:
+            report += "Nothing changed since last time.\n"
+        if attention:
+            report += "Needs attention (%d):\n" % attention
+            for f in p_findings[1:]:
+                if f.severity in ("warn", "bad"):
+                    report += "  ! %s\n" % f.title
+        else:
+            report += "Nothing needs attention.\n"
+        log("Preventative check: %d item(s) need attention, %d "
+            "change(s)." % (attention, len(p_changes)))
     report_path = os.path.join(app_dir(),
                                "auto-check-%s.txt" % stamp)
     try:
@@ -3659,15 +4578,2044 @@ def cmd_scan_only():
         with open(os.path.join(app_dir(), STATUS_FILE), "w",
                   encoding="utf-8") as fh:
             fh.write("Last auto-check: %s\nProblems found: %d\n%s\n"
+                     "Preventative items needing attention: %d\n"
                      "Full report: %s\n"
                      % (stamp, summary["problems"], comparison,
-                        report_path))
+                        attention, report_path))
     except OSError as exc:
         log("Could not save auto-check report: %s" % exc)
     log("Done. %s" % comparison)
     print("Auto-check complete: %d problems. %s"
           % (summary["problems"], comparison))
     return 0
+
+
+# ----------------------------------------------------------------------
+# Troubleshooter (v1.1.0) — pick a problem area; run ordered REAL
+# checks (cheap first, deep later); end in exactly ONE honest outcome:
+#   * "fixable"  — a cause was found and a safe fix exists. The fix
+#                  runs through build_fix_plan/execute_plan, so the
+#                  restore-point hard gate applies, and afterwards the
+#                  failing check is re-run to verify pass/fail.
+#   * "guided"   — a cause was found but is NOT safely auto-fixable:
+#                  a numbered, plain-language step-by-step guide
+#                  tailored to that cause.
+#   * "not_found"— every check passed or was inconclusive: say so,
+#                  list what was checked and ruled out, and give the
+#                  next manual steps. A cause is NEVER invented.
+#
+# Checks read through an env probe object. Unit tests inject a fake
+# env; WindowsProbes (below) is the real one. Every check returns
+# {id, title, status, evidence, cause} with status in
+# pass|fail|info|unknown. A check that sets `cause` ends the flow.
+# ----------------------------------------------------------------------
+
+def _ts_result(cid, title, status, evidence, cause=None):
+    return {"id": cid, "title": title, "status": status,
+            "evidence": evidence, "cause": cause}
+
+
+def _ts_cause(cid, title, explanation, fixes=None, guide=None,
+              verify_check=None):
+    return {"id": cid, "title": title, "explanation": explanation,
+            "fixes": fixes, "guide": guide,
+            "verify_check": verify_check}
+
+
+def _ev_count(events, provider_sub, ids=None):
+    n = 0
+    for ev in events or []:
+        if provider_sub in (ev.get("ProviderName") or "").lower():
+            if ids is None or int(ev.get("Id") or 0) in ids:
+                n += 1
+    return n
+
+
+# ---- slow / startup ---------------------------------------------------
+
+def _check_boot_time(env, prior):
+    boot = env.boot()
+    if not boot or not boot.get("latest_boot"):
+        return _ts_result("boot_time", "Last boot duration", "unknown",
+                          "No boot-performance records could be read.")
+    secs = boot["latest_boot"]["total_ms"] / 1000.0
+    if secs > 120:
+        return _ts_result(
+            "boot_time", "Last boot duration", "fail",
+            "Last boot took %.0f seconds — that is slow. (Symptom "
+            "only; the checks below look for the cause.)" % secs)
+    return _ts_result("boot_time", "Last boot duration", "pass",
+                      "Last boot took %.0f seconds." % secs)
+
+
+def _check_startup_dead(env, prior):
+    items = env.startup_items()
+    missing = items.get("missing") or []
+    if missing:
+        fixes = [{"kind": "startup_disable",
+                  "label": "Disable dead startup entry: %s" % m["name"],
+                  "payload": {"disable": m["disable"]}}
+                 for m in missing]
+        return _ts_result(
+            "startup_dead", "Dead startup entries", "fail",
+            "%d startup entr%s point at files that no longer exist "
+            "(%s). Windows wastes time on them at every sign-in."
+            % (len(missing), "y" if len(missing) == 1 else "ies",
+               ", ".join(m["name"] for m in missing)),
+            _ts_cause(
+                "dead_startup_entries",
+                "Dead startup entries are slowing sign-in",
+                "These programs were removed but their startup "
+                "entries stayed behind. Disabling the entries is "
+                "safe and reversible (each is backed up first).",
+                fixes=fixes, verify_check="startup_dead"))
+    return _ts_result("startup_dead", "Dead startup entries", "pass",
+                      "No startup entry points at a missing file.")
+
+
+def _check_startup_console(env, prior):
+    items = env.startup_items()
+    console = items.get("console") or []
+    if console:
+        fixes = [{"kind": "startup_disable",
+                  "label": "Disable console startup item: %s"
+                           % c["name"],
+                  "payload": {"disable": c["disable"]}}
+                 for c in console]
+        return _ts_result(
+            "startup_console", "Console-style startup items", "fail",
+            "%d startup item(s) run through a console (cmd / "
+            "PowerShell / script): %s. These are the usual cause of "
+            "black command windows flashing at sign-in."
+            % (len(console),
+               ", ".join(c["name"] for c in console)),
+            _ts_cause(
+                "console_startup_items",
+                "Console startup items (black-window suspects)",
+                "Console-style startup items pop a black window at "
+                "sign-in and add startup time. If you don't "
+                "recognize one, disabling it is the test — it is "
+                "reversible from the backup.",
+                fixes=fixes, verify_check="startup_console"))
+    return _ts_result("startup_console",
+                      "Console-style startup items", "pass",
+                      "No console-style startup items found.")
+
+
+def _check_startup_bloat(env, prior):
+    items = env.startup_items()
+    total = items.get("total") or 0
+    if total > 12:
+        return _ts_result(
+            "startup_bloat", "Startup program count", "fail",
+            "%d programs run at sign-in. That many launchers, "
+            "updaters and helpers measurably slow startup." % total,
+            _ts_cause(
+                "too_many_startup_programs",
+                "Too many programs start with Windows",
+                "There is no single safe automatic fix — which of "
+                "these you need is your call — so this one is a "
+                "guide, not a fix.",
+                guide=[
+                    "Press Ctrl+Shift+Esc to open Task Manager.",
+                    "Open the 'Startup apps' tab (left side).",
+                    "Look at the 'Startup impact' column — start "
+                    "with the ones marked High.",
+                    "Right-click anything you don't need the moment "
+                    "you sign in (updaters, game launchers, chat "
+                    "apps) and choose Disable. Nothing is uninstalled "
+                    "— the program still opens normally when you "
+                    "click it.",
+                    "Restart and feel the difference. Re-enable "
+                    "anything you miss the same way.",
+                ]))
+    return _ts_result("startup_bloat", "Startup program count", "pass",
+                      "%d startup programs — not excessive." % total)
+
+
+def _check_disk_space_cause(env, prior):
+    vols = env.volumes()
+    sysvol = None
+    for v in vols:
+        if (v.get("DriveLetter") or "").upper() == "C":
+            sysvol = v
+            break
+    if sysvol is None and vols:
+        sysvol = vols[0]
+    if sysvol is None:
+        return _ts_result("disk_space", "Free space on system drive",
+                          "unknown", "Volume information unreadable.")
+    size = sysvol.get("Size") or 0
+    free = sysvol.get("SizeRemaining") or 0
+    pct = (100.0 * free / size) if size else 0
+    if pct < 10:
+        sizes = env.junk_sizes()
+        fixes = []
+        for key, nbytes in (sizes or {}).items():
+            if nbytes and nbytes > 50 * 1024 * 1024:
+                fixes.append({
+                    "kind": "cleanup_temp",
+                    "label": "Clear temporary files (%s)"
+                             % human_size(nbytes),
+                    "payload": {"which": key,
+                                "path": _temp_path_for(key)}})
+        cause_fixes = fixes or None
+        guide = None
+        if not cause_fixes:
+            guide = [
+                "Open Settings → System → Storage to see what is "
+                "using the drive.",
+                "Turn on Storage Sense, or clear 'Temporary files' "
+                "from that page.",
+                "Uninstall large programs you no longer use "
+                "(Settings → Apps).",
+                "Move big personal files (videos, downloads) to "
+                "another drive or an external disk.",
+            ]
+        return _ts_result(
+            "disk_space", "Free space on system drive", "fail",
+            "Drive %s: is %.0f%% free (%s). A nearly-full system "
+            "drive slows everything and breaks updates."
+            % (sysvol.get("DriveLetter"), pct, human_size(free)),
+            _ts_cause(
+                "system_drive_nearly_full",
+                "The system drive is nearly full",
+                "Windows needs free space for updates, virtual "
+                "memory and temp files. Clearing temporary files is "
+                "safe — programs recreate what they need." if fixes
+                else "The space is held by things this app won't "
+                     "delete for you, so this is a guide.",
+                fixes=cause_fixes, guide=guide,
+                verify_check="disk_space"))
+    return _ts_result(
+        "disk_space", "Free space on system drive", "pass",
+        "Drive %s: has %.0f%% free (%s)."
+        % (sysvol.get("DriveLetter"), pct, human_size(free)))
+
+
+def _temp_path_for(which):
+    """Map a junk_locations key back to its path (for fix payloads)."""
+    for key, _label, path, _kind in junk_locations():
+        if key == which:
+            return path
+    return None
+
+
+def _check_disk_health_cause(env, prior):
+    disks = env.disk_health()
+    bad = [d for d in (disks or [])
+           if str(d.get("HealthStatus") or "").lower() != "healthy"]
+    if bad:
+        names = ", ".join(d.get("FriendlyName") or "Disk" for d in bad)
+        return _ts_result(
+            "disk_health", "Physical disk health", "fail",
+            "Windows reports %s as not healthy." % names,
+            _ts_cause(
+                "disk_unhealthy",
+                "A disk is reporting poor health",
+                "No software fix repairs a failing drive — the fix "
+                "is backup first, then replacement.",
+                guide=[
+                    "Back up anything important on that drive NOW — "
+                    "before any other troubleshooting.",
+                    "Note the drive model from the Disks section of "
+                    "the main scan.",
+                    "Replace the drive (or have a shop do it) and "
+                    "restore from your backup.",
+                    "If the PC is under warranty, contact the maker "
+                    "with the health status as evidence.",
+                ]))
+    if disks:
+        return _ts_result("disk_health", "Physical disk health",
+                          "pass",
+                          "All %d disk(s) report Healthy."
+                          % len(disks))
+    return _ts_result("disk_health", "Physical disk health",
+                      "unknown", "Disk health could not be read.")
+
+
+# ---- crashes ----------------------------------------------------------
+
+def _check_bugcheck(env, prior):
+    events = env.events(14)
+    n = sum(1 for ev in events if _is_bugcheck_event(ev))
+    if n >= 1:
+        codes = bugcheck_codes(events)
+        code_note = ""
+        if codes:
+            code_note = (" Recorded bugcheck code(s): %s."
+                         % ", ".join("%s (×%d)" % c for c in codes))
+        return _ts_result(
+            "bugcheck", "Blue-screen (bugcheck) events", "fail",
+            "%d blue-screen crash(es) in the last 14 days.%s"
+            % (n, code_note),
+            _ts_cause(
+                "repeated_bugcheck",
+                "Windows is blue-screen crashing",
+                "A bugcheck code points at a cause area, but "
+                "pinning the exact driver/hardware needs the crash "
+                "dump — beyond a safe automatic fix, so this is a "
+                "guide.",
+                guide=[
+                    "Write down the bugcheck code shown above "
+                    "(e.g. 0x000000d1) — searching that exact code "
+                    "on Microsoft's site names the usual suspects.",
+                    "Think about what changed just before the "
+                    "crashes started: a new driver, program, or "
+                    "hardware. Undo that change first.",
+                    "Update drivers ONLY through Windows Update or "
+                    "the PC maker's site — the Drivers section of "
+                    "this app shows what Windows Update matches.",
+                    "Run the Memory Diagnostic offered in this app's "
+                    "Memory section — bad RAM is a top cause of "
+                    "random blue screens.",
+                    "If crashes continue, the crash dumps in "
+                    "C:\\Windows\\Minidump are what a repair shop "
+                    "will ask for — don't delete them.",
+                ]))
+    return _ts_result("bugcheck", "Blue-screen (bugcheck) events",
+                      "pass", "No blue-screen events in 14 days.")
+
+
+def _check_kernel_power(env, prior):
+    events = env.events(14)
+    n = _ev_count(events, "kernel-power", {41})
+    if n >= 3:
+        return _ts_result(
+            "kernel_power", "Unexpected shutdowns (Kernel-Power 41)",
+            "fail",
+            "%d unexpected shutdowns in 14 days. That pattern points "
+            "at power, heat, or a hard freeze — not something a "
+            "software fix can prove or repair." % n,
+            _ts_cause(
+                "unexpected_shutdowns",
+                "Repeated unexpected shutdowns",
+                "Kernel-Power 41 only proves the PC lost power or "
+                "froze hard. The likely causes are physical.",
+                guide=[
+                    "Feel for heat: if the case/fans are very hot or "
+                    "loud before a shutdown, clean the vents and "
+                    "fans (powered off, compressed air).",
+                    "Check the power cable and, on a desktop, try a "
+                    "different wall outlet — skip old power strips "
+                    "while testing.",
+                    "If it only happens under load (games, video), "
+                    "heat or a weak power supply is the prime "
+                    "suspect.",
+                    "On a laptop, test with the charger plugged in "
+                    "and note whether the battery is swollen — if "
+                    "it is, stop using it and have it serviced.",
+                ]))
+    return _ts_result(
+        "kernel_power", "Unexpected shutdowns (Kernel-Power 41)",
+        "pass" if n == 0 else "info",
+        "%d unexpected shutdown(s) in 14 days — under the repeat "
+        "threshold." % n)
+
+
+def _check_sfc(env, prior):
+    res = env.sfc()
+    if not res:
+        return _ts_result("sfc", "System file integrity (SFC)",
+                          "unknown", "SFC verify could not be run.")
+    if res["status"] in ("violations", "violations_unfixed",
+                         "pending", "blocked"):
+        return _ts_result(
+            "sfc", "System file integrity (SFC)", "fail",
+            "SFC verify: %s." % res["message"],
+            _ts_cause(
+                "sfc_violations", "Corrupt Windows system files",
+                "SFC found corrupt system files. sfc /scannow "
+                "repairs them from the component store — that is "
+                "the safe, standard fix.",
+                fixes=[{"kind": "sfc_scannow",
+                        "label": "Repair system files with SFC "
+                                 "(sfc /scannow)", "payload": {}}],
+                verify_check="sfc"))
+    if res["status"] == "unknown":
+        return _ts_result("sfc", "System file integrity (SFC)",
+                          "unknown",
+                          "SFC ran but its result was not "
+                          "recognized (%s)." % res["message"])
+    return _ts_result("sfc", "System file integrity (SFC)", "pass",
+                      "SFC verify: %s." % res["message"])
+
+
+def _check_dism(env, prior):
+    res = env.dism()
+    if not res:
+        return _ts_result("dism", "Component store health (DISM)",
+                          "unknown", "DISM check could not be run.")
+    if res["status"] == "repairable":
+        return _ts_result(
+            "dism", "Component store health (DISM)", "fail",
+            "DISM: %s." % res["message"],
+            _ts_cause(
+                "dism_repairable",
+                "The Windows component store is corrupted",
+                "SFC and Windows Update both depend on the "
+                "component store. DISM /RestoreHealth is the "
+                "standard repair.",
+                fixes=[{"kind": "dism_restore",
+                        "label": "Repair the component store "
+                                 "(DISM /RestoreHealth)",
+                        "payload": {}}],
+                verify_check="dism"))
+    if res["status"] == "not_repairable":
+        return _ts_result(
+            "dism", "Component store health (DISM)", "fail",
+            "DISM: %s." % res["message"],
+            _ts_cause(
+                "dism_not_repairable",
+                "Component store damage DISM cannot repair",
+                "When DISM says the store is not repairable, the "
+                "remaining standard path is a Windows repair "
+                "install (keeps files and apps).",
+                guide=[
+                    "Back up your important files first — a repair "
+                    "install is designed to keep them, but a backup "
+                    "is cheap insurance.",
+                    "Download the Windows ISO or Media Creation "
+                    "Tool from Microsoft's official site only.",
+                    "Run setup.exe from inside Windows and choose "
+                    "'Keep personal files and apps'.",
+                    "Afterwards, run Windows Update until no more "
+                    "updates are offered, then re-run this "
+                    "troubleshooter.",
+                ]))
+    if res["status"] == "healthy":
+        return _ts_result("dism", "Component store health (DISM)",
+                          "pass", "DISM: %s." % res["message"])
+    return _ts_result("dism", "Component store health (DISM)",
+                      "unknown", "DISM: %s." % res["message"])
+
+
+def _check_whea(env, prior):
+    events = env.events(30)
+    n = _ev_count(events, "whea-logger")
+    if n >= 1:
+        return _ts_result(
+            "whea", "Hardware error events (WHEA)", "fail",
+            "%d WHEA hardware-error event(s) in 30 days. Windows "
+            "logs these when the CPU/memory/pcie hardware itself "
+            "reports an error." % n,
+            _ts_cause(
+                "whea_errors", "The hardware is reporting errors",
+                "WHEA events come from the hardware, not from "
+                "software settings — no safe automatic fix exists.",
+                guide=[
+                    "If the PC is overclocked, return it to stock "
+                    "speeds and see if the events stop.",
+                    "Run the Memory Diagnostic in this app's Memory "
+                    "section — RAM is the most common source.",
+                    "Make sure vents are clear and fans spin; heat "
+                    "causes correctable hardware errors.",
+                    "If events continue on a machine under warranty, "
+                    "contact the maker and quote 'WHEA-Logger' plus "
+                    "the event count.",
+                ]))
+    return _ts_result("whea", "Hardware error events (WHEA)", "pass",
+                      "No WHEA hardware-error events in 30 days.")
+
+
+def _check_problem_devices(env, prior):
+    devs = env.problem_devices()
+    if devs:
+        lines = ["%s — %s" % (d["name"], d["meaning"]) for d in devs]
+        return _ts_result(
+            "problem_devices", "Devices with problem codes", "fail",
+            "%d device(s) report problems: %s"
+            % (len(devs), "; ".join(lines)),
+            _ts_cause(
+                "problem_devices",
+                "One or more devices have driver problems",
+                "The Drivers section of the main scan lists "
+                "Windows Update's matched driver updates for this "
+                "exact hardware — the only driver source this app "
+                "trusts.",
+                guide=[
+                    "Run the main scan and open 'Drivers & "
+                    "devices' — install any matched update for the "
+                    "named device (a restore point and driver "
+                    "backup happen first, in the same run).",
+                    "If no update is matched, open Device Manager, "
+                    "right-click the device → Uninstall device, "
+                    "then restart — Windows reinstalls a clean "
+                    "driver.",
+                    "For a device you just plugged in, try a "
+                    "different USB port/cable before assuming it "
+                    "is broken.",
+                ]))
+    return _ts_result("problem_devices",
+                      "Devices with problem codes", "pass",
+                      "No devices report problem codes.")
+
+
+def _check_memory_diag(env, prior):
+    res = env.memory_diag()
+    if not res or not res.get("ran"):
+        return _ts_result("memory_diag", "Windows Memory Diagnostic",
+                          "info",
+                          "No memory-diagnostic result has been "
+                          "recorded on this PC. The main scan's "
+                          "Memory section can schedule one at the "
+                          "next reboot if crashes continue.")
+    if res.get("failed"):
+        return _ts_result(
+            "memory_diag", "Windows Memory Diagnostic", "fail",
+            "The last memory diagnostic reported hardware problems.",
+            _ts_cause(
+                "memory_fault", "RAM failed the memory diagnostic",
+                "Faulty RAM corrupts files and crashes randomly. "
+                "No software setting fixes it.",
+                guide=[
+                    "If the PC has more than one RAM stick, test "
+                    "one at a time (powered off, unplugged) to find "
+                    "the bad one.",
+                    "Reseat the sticks — pull them out and click "
+                    "them firmly back in; dirty contacts mimic "
+                    "failure.",
+                    "Replace the failing stick with the same type "
+                    "and speed (the PC maker's site lists what's "
+                    "compatible).",
+                    "Re-run the Memory Diagnostic after any change "
+                    "until it passes clean.",
+                ]))
+    return _ts_result("memory_diag", "Windows Memory Diagnostic",
+                      "pass", "The last memory diagnostic passed.")
+
+
+# ---- network ----------------------------------------------------------
+
+def _check_adapters(env, prior):
+    adapters = env.adapters()
+    if adapters is None:
+        return _ts_result("adapters", "Network adapters", "unknown",
+                          "Adapter information could not be read.")
+    if not adapters:
+        return _ts_result(
+            "adapters", "Network adapters", "fail",
+            "Windows sees NO network adapters at all.",
+            _ts_cause(
+                "no_adapters", "No network adapter is visible",
+                "With no adapter, there is nothing for software "
+                "settings to fix — this is a driver or hardware "
+                "problem.",
+                guide=[
+                    "Open Device Manager → Network adapters. If "
+                    "the adapter is missing entirely, the hardware "
+                    "or its driver is gone.",
+                    "If it shows with a yellow warning, note the "
+                    "problem code and use the main scan's Drivers "
+                    "section.",
+                    "On a laptop, check for a physical Wi-Fi switch "
+                    "or airplane-mode key (often Fn + a function "
+                    "key).",
+                    "If it vanished after a Windows update, Device "
+                    "Manager → the adapter → Driver → Roll Back "
+                    "Driver.",
+                ]))
+    up = [a for a in adapters if a["status"].lower() == "up"]
+    if up:
+        return _ts_result(
+            "adapters", "Network adapters", "pass",
+            "%d adapter(s) present; %s is up (%s)."
+            % (len(adapters), up[0]["name"], up[0]["link_speed"]
+               or "link speed unknown"))
+    return _ts_result(
+        "adapters", "Network adapters", "fail",
+        "%d adapter(s) present but none is 'Up' — the cable/Wi-Fi "
+        "is not connected." % len(adapters))
+
+
+def _check_gateway(env, prior):
+    ping = env.ping_gateway()
+    if ping is None:
+        return _ts_result("gateway", "Router (default gateway) "
+                          "reachable", "unknown",
+                          "The gateway ping could not be run.")
+    if ping["ok"]:
+        return _ts_result("gateway", "Router (default gateway) "
+                          "reachable", "pass",
+                          "Gateway answered (%d/%d replies)."
+                          % (ping["received"], ping["sent"]))
+    return _ts_result(
+        "gateway", "Router (default gateway) reachable", "fail",
+        "The router did not answer any ping (%d/%d replies). The "
+        "break is between this PC and the router."
+        % (ping["received"], ping["sent"]),
+        _ts_cause(
+            "gateway_unreachable", "The router isn't answering",
+            "The adapter is up but the router doesn't respond — "
+            "that is cabling, Wi-Fi association, or the router "
+            "itself, not Windows settings.",
+            guide=[
+                "Restart the router: unplug it for 30 seconds, "
+                "plug it back in, wait 2 minutes, test again.",
+                "For Wi-Fi: forget the network and rejoin it "
+                "(Settings → Network → Wi-Fi → Manage known "
+                "networks).",
+                "For a cable: try a different cable and a "
+                "different router port.",
+                "Check whether other devices can use the same "
+                "router — if none can, the router or the internet "
+                "line is down; call the provider.",
+            ]))
+
+
+def _check_dns(env, prior):
+    res = env.dns_lookup()
+    if res is None:
+        return _ts_result("dns", "DNS name lookup", "unknown",
+                          "The DNS test could not be run.")
+    if res["ok"]:
+        return _ts_result("dns", "DNS name lookup", "pass",
+                          "A public name resolved successfully.")
+    gw_ok = any(r["id"] == "gateway" and r["status"] == "pass"
+                for r in prior)
+    if gw_ok:
+        return _ts_result(
+            "dns", "DNS name lookup", "fail",
+            "DNS lookup failed (%s) even though the router answers "
+            "— the classic sign of a stale/corrupt DNS cache or a "
+            "dead DNS service." % res["detail"],
+            _ts_cause(
+                "dns_failing",
+                "DNS lookups are failing",
+                "The PC can reach the router but can't translate "
+                "names to addresses. Flushing the DNS cache is "
+                "the safe first repair.",
+                fixes=[{"kind": "dns_flush",
+                        "label": "Flush the DNS cache "
+                                 "(ipconfig /flushdns)",
+                        "payload": {}}],
+                verify_check="dns"))
+    return _ts_result("dns", "DNS name lookup", "fail",
+                      "DNS lookup failed (%s)." % res["detail"])
+
+
+def _check_net_services(env, prior):
+    states = env.services(["dhcp", "dnscache"])
+    bad = []
+    for name in ("dhcp", "dnscache"):
+        svc = states.get(name)
+        if svc and (svc["start_type"].lower() == "disabled"
+                    or svc["status"].lower() not in ("running",)):
+            bad.append((name, svc))
+    if bad:
+        fixes = [{"kind": "service_start",
+                  "label": "Set %s back to Manual and start it"
+                           % svc["display"],
+                  "payload": {"name": name,
+                              "display": svc["display"]}}
+                 for name, svc in bad]
+        desc = "; ".join("%s is %s (%s)"
+                         % (svc["display"], svc["status"],
+                            svc["start_type"]) for _n, svc in bad)
+        return _ts_result(
+            "net_services", "Network services (DHCP / DNS Client)",
+            "fail", desc + ". Without DHCP this PC gets no address; "
+            "without the DNS Client, name lookups crawl or fail.",
+            _ts_cause(
+                "net_services_down",
+                "A network service is stopped or disabled",
+                "These services are how the PC gets its address "
+                "and resolves names. Restoring them to Manual and "
+                "starting them is the standard repair (their "
+                "previous state is saved first).",
+                fixes=fixes, verify_check="net_services"))
+    return _ts_result("net_services",
+                      "Network services (DHCP / DNS Client)", "pass",
+                      "DHCP and DNS Client services are running.")
+
+
+def _check_proxy(env, prior):
+    proxy = env.proxy()
+    if proxy and proxy.get("enabled"):
+        return _ts_result(
+            "proxy", "Proxy configuration", "fail",
+            "A proxy is configured: %s. A leftover proxy (from old "
+            "work software or malware cleanup) silently breaks "
+            "browsing while everything else looks fine."
+            % proxy.get("server"),
+            _ts_cause(
+                "proxy_configured",
+                "A proxy server is configured",
+                "If you (or your workplace) didn't set this on "
+                "purpose, it shouldn't be there. Removing it is a "
+                "settings change this app leaves to you, in "
+                "Windows' own page.",
+                guide=[
+                    "Open Settings → Network & internet → Proxy.",
+                    "Turn OFF 'Use a proxy server' (and note what "
+                    "was written there, in case IT support set it).",
+                    "Also check 'Automatically detect settings' is "
+                    "ON.",
+                    "Restart the browser and test a few sites.",
+                ]))
+    return _ts_result("proxy", "Proxy configuration", "pass",
+                      "No manual proxy is configured.")
+
+
+def _check_net_stack(env, prior):
+    fails = [r for r in prior if r["status"] == "fail"]
+    if fails:
+        return _ts_result(
+            "net_stack", "Network stack reset (last resort)",
+            "fail",
+            "Earlier checks found problems (%s) but none of the "
+            "targeted causes matched."
+            % ", ".join(r["title"] for r in fails),
+            _ts_cause(
+                "net_stack_reset",
+                "The network stack itself may be damaged",
+                "Resetting Winsock and the TCP/IP stack is the "
+                "standard last-resort repair. It needs a restart, "
+                "and manual settings (like a fixed IP address) "
+                "will need re-entering — that's why it's opt-in.",
+                fixes=[{"kind": "net_reset",
+                        "label": "Reset the network stack (Winsock "
+                                 "+ TCP/IP) — restart required",
+                        "payload": {}}],
+                verify_check="dns"))
+    return _ts_result("net_stack", "Network stack reset (last "
+                      "resort)", "pass",
+                      "Not needed — earlier checks explain the "
+                      "state.")
+
+
+# ---- sound ------------------------------------------------------------
+
+def _check_audio_services(env, prior):
+    audio = env.audio()
+    states = (audio or {}).get("services") or {}
+    bad = []
+    for name in ("audiosrv", "audioendpointbuilder"):
+        svc = states.get(name)
+        if svc and svc["status"].lower() != "running":
+            bad.append((name, svc))
+    if bad:
+        fixes = [{"kind": "service_start",
+                  "label": "Start the %s service" % svc["display"],
+                  "payload": {"name": name,
+                              "display": svc["display"]}}
+                 for name, svc in bad]
+        desc = "; ".join("%s is %s (%s)"
+                         % (svc["display"], svc["status"],
+                            svc["start_type"]) for _n, svc in bad)
+        return _ts_result(
+            "audio_services", "Windows Audio services", "fail",
+            desc + ". No audio service, no sound — this is the "
+            "most common 'my sound vanished' cause.",
+            _ts_cause(
+                "audio_services_stopped",
+                "The Windows Audio service is stopped",
+                "Sound depends on these services. Starting them "
+                "(previous state saved first) is the standard, "
+                "safe repair.",
+                fixes=fixes, verify_check="audio_services"))
+    return _ts_result("audio_services", "Windows Audio services",
+                      "pass", "Audio services are running.")
+
+
+def _check_audio_devices(env, prior):
+    audio = env.audio() or {}
+    devices = audio.get("devices") or []
+    problem = audio.get("problem_devices") or []
+    if problem:
+        names = "; ".join("%s (%s)" % (d["name"], d["meaning"])
+                          for d in problem)
+        return _ts_result(
+            "audio_devices", "Sound devices", "fail",
+            "Audio device problem(s): %s." % names,
+            _ts_cause(
+                "audio_device_problem",
+                "An audio device has a driver problem",
+                "The device is present but its driver isn't "
+                "working. Driver updates come from Windows "
+                "Update (see the main scan's Drivers section).",
+                guide=[
+                    "Run the main scan → 'Drivers & devices' and "
+                    "install any matched audio driver update.",
+                    "Or open Device Manager → Sound, video and "
+                    "game controllers → the device → Update "
+                    "driver.",
+                    "If it broke right after an update, use Roll "
+                    "Back Driver in the same place instead.",
+                ]))
+    if not devices:
+        return _ts_result(
+            "audio_devices", "Sound devices", "fail",
+            "Windows sees no sound device at all.",
+            _ts_cause(
+                "no_audio_device", "No sound device is visible",
+                "Either the hardware is disabled (BIOS/firmware) "
+                "or its driver is entirely missing.",
+                guide=[
+                    "Check the obvious: speakers/headphones "
+                    "plugged into the right jack, not muted, and "
+                    "a Bluetooth device actually connected.",
+                    "Open Device Manager → Sound, video and game "
+                    "controllers. If nothing is listed, choose "
+                    "Action → Scan for hardware changes.",
+                    "If still nothing, the driver is on the PC "
+                    "maker's support page for your model — "
+                    "download it only from there.",
+                ]))
+    endpoints = audio.get("endpoints") or []
+    if endpoints and not any(
+            (e.get("Status") or "").lower() == "ok"
+            for e in endpoints):
+        return _ts_result(
+            "audio_devices", "Sound devices", "fail",
+            "Playback devices exist but none reports OK — check "
+            "the default output in Sound settings.",
+            _ts_cause(
+                "no_ok_endpoint", "No working playback device",
+                "Windows has playback endpoints but none is in a "
+                "working state.",
+                guide=[
+                    "Right-click the speaker icon → Sound settings.",
+                    "Under Output, pick the device you actually "
+                    "use and press Test.",
+                    "If your device isn't listed, enable 'Show "
+                    "disabled devices' from the classic Sound "
+                    "panel (More sound settings).",
+                ]))
+    return _ts_result("audio_devices", "Sound devices", "pass",
+                      "%d sound device(s) present and reporting "
+                      "normally." % len(devices))
+
+
+# ---- windows update ---------------------------------------------------
+
+_WU_SERVICE_KEYS = ("wuauserv", "bits", "cryptsvc", "usosvc")
+
+
+def _check_wu_services(env, prior):
+    states = env.services(list(_WU_SERVICE_KEYS))
+    labels = {"wuauserv": "Windows Update", "bits": "Background "
+              "Transfer (BITS)", "cryptsvc": "Cryptographic "
+              "Services", "usosvc": "Update Orchestrator"}
+    disabled = []
+    for key in _WU_SERVICE_KEYS:
+        svc = states.get(key)
+        if svc and svc["start_type"].lower() == "disabled":
+            disabled.append((key, svc))
+    if disabled:
+        fixes = [{"kind": "service_start",
+                  "label": "Re-enable the %s service"
+                           % labels[key],
+                  "payload": {"name": key, "display": labels[key]}}
+                 for key, _svc in disabled]
+        return _ts_result(
+            "wu_services", "Windows Update services", "fail",
+            "Disabled: %s. A disabled update service means no "
+            "updates can install, full stop."
+            % ", ".join(labels[k] for k, _s in disabled),
+            _ts_cause(
+                "wu_service_disabled",
+                "An update service is disabled",
+                "Something (a 'debloat' tool, old group policy, or "
+                "malware cleanup) disabled it. Setting it back to "
+                "Manual and starting it is the repair; the "
+                "previous state is saved first.",
+                fixes=fixes, verify_check="wu_services"))
+    return _ts_result("wu_services", "Windows Update services",
+                      "pass",
+                      "No update service is disabled.")
+
+
+def _check_pending_reboot(env, prior):
+    reasons = env.pending_reboot()
+    if reasons:
+        return _ts_result(
+            "pending_reboot", "Pending reboot", "fail",
+            "A reboot is pending: %s. Updates cannot finish "
+            "installing across a pending reboot."
+            % "; ".join(reasons),
+            _ts_cause(
+                "reboot_pending", "Windows needs a restart first",
+                "This isn't a fault — but no update troubleshooting "
+                "means anything until the pending restart clears.",
+                guide=[
+                    "Save your work and restart the PC "
+                    "(Start → Power → Restart — not Shut down, "
+                    "which can defer the servicing on some "
+                    "setups).",
+                    "After the restart, run this troubleshooter "
+                    "again — if updates still fail, the next "
+                    "checks will see the real error.",
+                ]))
+    return _ts_result("pending_reboot", "Pending reboot", "pass",
+                      "No reboot is pending.")
+
+
+def _check_wu_history(env, prior):
+    events = env.events(30, provider_like="WindowsUpdateClient")
+    fails = _ev_count(events, "windowsupdateclient", {20})
+    if fails >= 1:
+        codes = wu_error_codes(events)
+        code_txt = (" Error code(s) seen: %s."
+                    % ", ".join("%s (×%d)" % c for c in codes)
+                    ) if codes else ""
+        return _ts_result(
+            "wu_history", "Recent update failures", "fail",
+            "%d failed update install(s) in the last 30 days.%s"
+            % (fails, code_txt),
+            _ts_cause(
+                "wu_cache_suspect",
+                "Updates are downloading/installing and failing",
+                "With the services healthy and no reboot pending, "
+                "repeated install failures are most often a "
+                "corrupt update download cache. Resetting it "
+                "(the old cache is renamed, not deleted) is the "
+                "standard Microsoft repair.",
+                fixes=[{"kind": "wu_reset",
+                        "label": "Reset the Windows Update "
+                                 "download cache (old cache kept "
+                                 "as a renamed backup)",
+                        "payload": {}}],
+                verify_check="wu_history"))
+    return _ts_result("wu_history", "Recent update failures",
+                      "pass",
+                      "No failed update installs in 30 days.")
+
+
+def _check_wu_search(env, prior):
+    res = env.wu_search()
+    if not res or not res.get("ok"):
+        err = (res or {}).get("error") or "search did not answer"
+        return _ts_result(
+            "wu_search", "Windows Update search", "fail",
+            "Asking Windows Update to search failed: %s." % err,
+            _ts_cause(
+                "wu_search_failing",
+                "Windows Update can't even search",
+                "A search failure with healthy services usually "
+                "means the update data store/cache is corrupt — "
+                "the cache reset is the standard first repair.",
+                fixes=[{"kind": "wu_reset",
+                        "label": "Reset the Windows Update "
+                                 "download cache (old cache kept "
+                                 "as a renamed backup)",
+                        "payload": {}}],
+                verify_check="wu_search"))
+    return _ts_result("wu_search", "Windows Update search", "pass",
+                      "Search works — %d update(s) currently "
+                      "offered." % (res.get("count") or 0))
+
+
+# ---- disk -------------------------------------------------------------
+
+def _check_smart(env, prior):
+    preds = env.smart_predict()
+    if preds is None:
+        return _ts_result("smart", "SMART failure prediction",
+                          "unknown",
+                          "This PC's drives/controllers don't "
+                          "expose SMART prediction — not a pass, "
+                          "just no data.")
+    failing = [p for p in preds if p["predict_failure"]]
+    if failing:
+        return _ts_result(
+            "smart", "SMART failure prediction", "fail",
+            "SMART predicts FAILURE for: %s. The drive's own "
+            "diagnostics say it is dying."
+            % ", ".join(p["instance"] for p in failing),
+            _ts_cause(
+                "smart_failure_predicted",
+                "A drive is predicting its own failure",
+                "This is the one disk warning to drop everything "
+                "for. No fix exists — backup, then replacement.",
+                guide=[
+                    "Back up everything important on that drive "
+                    "RIGHT NOW — before restarting, before "
+                    "scanning, before anything.",
+                    "Stop using the drive for anything new.",
+                    "Replace the drive (or have a shop clone it "
+                    "to a new one while it still reads).",
+                    "If it's the system drive and the PC is under "
+                    "warranty, contact the maker today.",
+                ]))
+    return _ts_result("smart", "SMART failure prediction", "pass",
+                      "No drive predicts failure.")
+
+
+def _check_disk_events(env, prior):
+    events = env.events(30)
+    n = sum(_ev_count(events, prov, ids) for prov, ids in
+            (("disk", {7, 11, 51, 129}), ("ntfs", {55})))
+    if n >= 3:
+        return _ts_result(
+            "disk_events", "Disk error events (30 days)", "fail",
+            "%d disk/NTFS error events in 30 days (bad blocks, "
+            "controller errors, file-system corruption). A pattern, "
+            "not noise." % n,
+            _ts_cause(
+                "disk_error_pattern",
+                "The disk is logging repeated errors",
+                "Repeated disk errors mean a struggling drive, a "
+                "bad cable, or file-system damage. Software can "
+                "check the file system; it cannot fix failing "
+                "hardware.",
+                guide=[
+                    "Back up important files first — before any "
+                    "disk repair.",
+                    "Run the main scan's Disk section: chkdsk "
+                    "/scan gives a read-only verdict.",
+                    "If chkdsk reports problems, the repair is "
+                    "'chkdsk C: /f' at a restart — this app "
+                    "deliberately leaves that scheduling to you.",
+                    "On a desktop, reseat or replace the drive's "
+                    "data cable — a surprising share of these are "
+                    "just cables.",
+                    "If errors continue after a cable swap, "
+                    "replace the drive.",
+                ]))
+    return _ts_result("disk_events", "Disk error events (30 days)",
+                      "pass" if n == 0 else "info",
+                      "%d disk error event(s) in 30 days — under "
+                      "the pattern threshold." % n)
+
+
+# ---- security ---------------------------------------------------------
+
+def _check_defender_present(env, prior):
+    st = env.defender()
+    if not st or not st.get("present"):
+        return _ts_result(
+            "defender_present", "Defender status readable", "fail",
+            "Get-MpComputerStatus did not return usable data.",
+            _ts_cause(
+                "defender_unreadable",
+                "Defender status can't be read",
+                "Either a third-party antivirus has taken over "
+                "(then IT is your protection — check its own app) "
+                "or Defender's service is broken.",
+                guide=[
+                    "Open Windows Security → Virus & threat "
+                    "protection. It names the antivirus in charge.",
+                    "If a third-party antivirus is listed and "
+                    "healthy, you're protected — this check just "
+                    "can't see into it.",
+                    "If nothing is listed, run the main scan's "
+                    "Security fixes and a Defender Quick Scan.",
+                    "Still nothing: Settings → Apps → check for a "
+                    "half-uninstalled antivirus and remove it "
+                    "fully, then restart.",
+                ]))
+    return _ts_result("defender_present", "Defender status readable",
+                      "pass", defender_summary_line(st))
+
+
+def _check_rtp(env, prior):
+    st = env.defender()
+    if st and st.get("present") and not st.get("rtp"):
+        return _ts_result(
+            "rtp", "Real-time protection", "fail",
+            "Real-time protection is OFF — malware is only caught "
+            "(if at all) during scans.",
+            _ts_cause(
+                "rtp_off", "Real-time protection is off",
+                "Turning it back on is safe and immediate.",
+                fixes=[{"kind": "defender_rtp_enable",
+                        "label": "Turn Defender real-time "
+                                 "protection back on",
+                        "payload": {}}],
+                verify_check="rtp"))
+    return _ts_result("rtp", "Real-time protection", "pass",
+                      "Real-time protection is on.")
+
+
+def _check_sig_age(env, prior):
+    st = env.defender()
+    if not st or not st.get("present"):
+        return _ts_result("sig_age", "Signature age", "unknown",
+                          "Defender status unreadable.")
+    age = st.get("sig_age_days")
+    if age is not None and age > 7:
+        return _ts_result(
+            "sig_age", "Signature age", "fail",
+            "Antivirus signatures are %d days old — new malware "
+            "from the last week is invisible to Defender." % age,
+            _ts_cause(
+                "signatures_stale", "Antivirus signatures are "
+                "stale",
+                "Updating signatures is free, quick and safe.",
+                fixes=[{"kind": "defender_update",
+                        "label": "Update Defender signatures now",
+                        "payload": {}}],
+                verify_check="sig_age"))
+    return _ts_result("sig_age", "Signature age", "pass",
+                      "Signatures are %s."
+                      % ("unknown age but present" if age is None
+                         else "%d day(s) old" % age))
+
+
+def _check_firewall(env, prior):
+    profiles = env.firewall()
+    off = [p for p in (profiles or []) if not p["enabled"]]
+    if off:
+        fixes = [{"kind": "firewall_enable",
+                  "label": "Turn the firewall ON for %s"
+                           % p["name"],
+                  "payload": {"profile": p["name"]}} for p in off]
+        return _ts_result(
+            "firewall", "Firewall profiles", "fail",
+            "Firewall is OFF for: %s."
+            % ", ".join(p["name"] for p in off),
+            _ts_cause(
+                "firewall_off", "The firewall is off",
+                "Turning the firewall back on is safe and "
+                "immediate.",
+                fixes=fixes, verify_check="firewall"))
+    return _ts_result("firewall", "Firewall profiles", "pass",
+                      "All firewall profiles are on.")
+
+
+def _check_exclusions(env, prior):
+    exclusions = env.exclusions()
+    if exclusions:
+        fixes = [{"kind": "exclusion_remove",
+                  "label": "Remove Defender exclusion: %s '%s'"
+                           % (e["type"], e["value"]),
+                  "payload": dict(e)} for e in exclusions]
+        return _ts_result(
+            "exclusions", "Defender exclusions", "fail",
+            "%d exclusion(s) tell Defender never to scan "
+            "something: %s. Malware hides behind exactly this."
+            % (len(exclusions),
+               "; ".join("%s '%s'" % (e["type"], e["value"])
+                         for e in exclusions)),
+            _ts_cause(
+                "defender_exclusions",
+                "Defender has scan exclusions",
+                "If you recognize and need an exclusion, keep it "
+                "— this fix removes ALL of them, so only run it "
+                "if none of them are yours. You can re-add one "
+                "in Windows Security at any time.",
+                fixes=fixes, verify_check="exclusions"))
+    return _ts_result("exclusions", "Defender exclusions", "pass",
+                      "No exclusions configured.")
+
+
+def _check_threats(env, prior):
+    threats = env.threats()
+    if threats:
+        return _ts_result(
+            "threats", "Threat detections on record", "fail",
+            "%d threat detection(s) are on record with Defender."
+            % len(threats),
+            _ts_cause(
+                "threat_history", "Defender has detected threats",
+                "Defender handles quarantine itself; what "
+                "matters is that you review what it found and "
+                "whether it succeeded.",
+                guide=[
+                    "Open Windows Security → Virus & threat "
+                    "protection → Protection history.",
+                    "Check each detection says 'Removed' or "
+                    "'Quarantined' — anything 'Allowed' that you "
+                    "don't recognize should be removed there.",
+                    "Run a full scan (Scan options → Full scan) "
+                    "and, for stubborn cases, the Microsoft "
+                    "Defender Offline scan on the same page.",
+                    "Change important passwords from a CLEAN "
+                    "device if any detection was a stealer-type "
+                    "threat.",
+                ]))
+    return _ts_result("threats", "Threat detections on record",
+                      "pass", "No threat detections on record.")
+
+
+TS_CHECKS = {
+    "boot_time": ("Last boot duration", _check_boot_time),
+    "startup_dead": ("Dead startup entries", _check_startup_dead),
+    "startup_console": ("Console-style startup items",
+                        _check_startup_console),
+    "startup_bloat": ("Startup program count", _check_startup_bloat),
+    "disk_space": ("Free space (system drive)", _check_disk_space_cause),
+    "disk_health": ("Physical disk health", _check_disk_health_cause),
+    "bugcheck": ("Blue-screen events", _check_bugcheck),
+    "kernel_power": ("Unexpected shutdowns", _check_kernel_power),
+    "sfc": ("System file integrity (SFC)", _check_sfc),
+    "dism": ("Component store health (DISM)", _check_dism),
+    "whea": ("Hardware error events (WHEA)", _check_whea),
+    "problem_devices": ("Devices with problem codes",
+                        _check_problem_devices),
+    "memory_diag": ("Memory diagnostic result", _check_memory_diag),
+    "adapters": ("Network adapters", _check_adapters),
+    "gateway": ("Router reachable", _check_gateway),
+    "dns": ("DNS name lookup", _check_dns),
+    "net_services": ("Network services", _check_net_services),
+    "proxy": ("Proxy configuration", _check_proxy),
+    "net_stack": ("Network stack reset", _check_net_stack),
+    "audio_services": ("Windows Audio services",
+                       _check_audio_services),
+    "audio_devices": ("Sound devices", _check_audio_devices),
+    "wu_services": ("Windows Update services", _check_wu_services),
+    "pending_reboot": ("Pending reboot", _check_pending_reboot),
+    "wu_history": ("Recent update failures", _check_wu_history),
+    "wu_search": ("Windows Update search", _check_wu_search),
+    "smart": ("SMART failure prediction", _check_smart),
+    "disk_events": ("Disk error events", _check_disk_events),
+    "defender_present": ("Defender status readable",
+                         _check_defender_present),
+    "rtp": ("Real-time protection", _check_rtp),
+    "sig_age": ("Signature age", _check_sig_age),
+    "firewall": ("Firewall profiles", _check_firewall),
+    "exclusions": ("Defender exclusions", _check_exclusions),
+    "threats": ("Threat detections", _check_threats),
+}
+
+TROUBLESHOOT_FLOWS = {
+    "slow_startup": {
+        "title": "Slow PC & startup trouble",
+        "category": "startup",
+        "checks": ["boot_time", "startup_dead", "startup_console",
+                   "startup_bloat", "disk_space", "disk_health"],
+        "manual_steps": [
+            "Open Task Manager (Ctrl+Shift+Esc) → Performance: if "
+            "CPU, Memory or Disk sits near 100% at idle, note which "
+            "— that column is the trail to follow.",
+            "Run the main scan in this app — the Boot and Startup "
+            "sections list slow boot offenders by name.",
+            "Check for a Windows Update stuck mid-install "
+            "(Settings → Windows Update) and let it finish.",
+            "If the PC is only slow right after sign-in and fine "
+            "ten minutes later, that is startup load — the Startup "
+            "tab in Task Manager is the lever.",
+        ],
+    },
+    "crashes": {
+        "title": "Crashes, freezes & blue screens",
+        "category": "events",
+        "checks": ["bugcheck", "kernel_power", "sfc", "dism",
+                   "whea", "problem_devices", "memory_diag"],
+        "manual_steps": [
+            "Note exactly what you were doing when it crashes — a "
+            "pattern (one game, one program, sleep/wake) is the "
+            "best clue there is.",
+            "Run the main scan; the 'Recent system errors' section "
+            "groups the errors with plain-language notes.",
+            "Undo the most recent change (driver, program, "
+            "hardware) that predates the crashes.",
+            "Schedule the Memory Diagnostic from the main scan's "
+            "Memory section — random crashes with clean software "
+            "checks are RAM until proven otherwise.",
+        ],
+    },
+    "network": {
+        "title": "Internet & network trouble",
+        "category": "devices",
+        "checks": ["adapters", "gateway", "dns", "net_services",
+                   "proxy", "net_stack"],
+        "manual_steps": [
+            "Restart the router and this PC (in that order) — it "
+            "clears more network trouble than everything else "
+            "combined.",
+            "Test another device on the same network: if it also "
+            "fails, it's the router or the provider, not this PC.",
+            "Try a different connection (phone hotspot) — if that "
+            "works, the fault is in the router's settings or the "
+            "line.",
+            "Note any error text verbatim; providers' support will "
+            "ask for it.",
+        ],
+    },
+    "sound": {
+        "title": "Sound problems",
+        "category": "devices",
+        "checks": ["audio_services", "audio_devices"],
+        "manual_steps": [
+            "Check the physical layer first: cable seated, "
+            "speakers powered, volume up on BOTH the device and "
+            "Windows.",
+            "Right-click the speaker icon → Sound settings → "
+            "choose the right Output device and press Test.",
+            "If one app is silent but others aren't, check that "
+            "app's own output setting and the Volume Mixer.",
+            "For Bluetooth audio: remove the device and pair it "
+            "again — stale pairings are a top cause.",
+        ],
+    },
+    "update": {
+        "title": "Windows Update failing",
+        "category": "update",
+        "checks": ["wu_services", "pending_reboot", "wu_history",
+                   "dism", "wu_search", "disk_space"],
+        "manual_steps": [
+            "Restart the PC once and try the update again — "
+            "servicing often completes across a restart.",
+            "Free up space: updates need several GB free on C:.",
+            "Note the exact error code from Settings → Windows "
+            "Update and search it on Microsoft's site.",
+            "If one update keeps failing but others install, "
+            "download that KB manually from the Microsoft Update "
+            "Catalog.",
+        ],
+    },
+    "disk": {
+        "title": "Disk & storage trouble",
+        "category": "disk",
+        "checks": ["smart", "disk_health", "disk_events",
+                   "disk_space"],
+        "manual_steps": [
+            "Back up first. Disk troubleshooting on a drive you "
+            "haven't backed up is gambling.",
+            "Run the main scan's Disk section for the read-only "
+            "chkdsk verdict.",
+            "Check the drive's health in the maker's own tool "
+            "(e.g. Samsung Magician, WD Dashboard) — they read "
+            "vendor SMART data this app can't.",
+            "Listen: clicking or grinding from a spinning drive "
+            "means power it off and go straight to replacement/"
+            "recovery.",
+        ],
+    },
+    "security": {
+        "title": "Security trouble (Defender & firewall)",
+        "category": "security",
+        "checks": ["defender_present", "rtp", "sig_age", "firewall",
+                   "exclusions", "threats"],
+        "manual_steps": [
+            "Open Windows Security and read the top summary — it "
+            "names anything it wants you to act on.",
+            "Run a Defender Full scan, then the Microsoft "
+            "Defender Offline scan if anything was found.",
+            "Review Protection history for anything 'Allowed' "
+            "that you don't recognize.",
+            "If a third-party antivirus is installed, make sure "
+            "its subscription hasn't lapsed into passive mode.",
+        ],
+    },
+}
+
+# Scan category -> troubleshooter area (the "Troubleshoot this"
+# routing used by the GUI and the preventative report).
+TS_AREA_FOR_CATEGORY = {
+    "sysfiles": "crashes", "events": "crashes", "memory": "crashes",
+    "disk": "disk", "junk": "disk",
+    "boot": "slow_startup", "startup": "slow_startup",
+    "programs": "slow_startup",
+    "update": "update", "security": "security", "devices": "sound",
+}
+
+
+def run_troubleshooter(area_id, env, log=None):
+    """Run a flow against env. -> outcome dict (see header comment).
+
+    Checks run in order; the first check that produces a cause ends
+    the flow (systematic: cheap checks first, and once the cause is
+    proven there is nothing more to rule out).
+    """
+    flow = TROUBLESHOOT_FLOWS[area_id]
+    results = []
+    outcome = {"area": area_id, "title": flow["title"],
+               "checks": results, "outcome": "not_found",
+               "cause": None, "next_steps": flow["manual_steps"]}
+    for cid in flow["checks"]:
+        title, fn = TS_CHECKS[cid]
+        try:
+            res = fn(env, results)
+        except Exception as exc:  # a broken probe is evidence, too
+            res = _ts_result(cid, title, "unknown",
+                             "This check could not run (%s)." % exc)
+        results.append(res)
+        if log:
+            log("TS[%s] %s: %s — %s" % (area_id, res["title"],
+                                        res["status"],
+                                        res["evidence"]))
+        if res.get("cause"):
+            outcome["cause"] = res["cause"]
+            outcome["outcome"] = ("fixable" if res["cause"].get(
+                "fixes") else "guided")
+            if log:
+                log("TS[%s] cause found: %s (%s)"
+                    % (area_id, res["cause"]["title"],
+                       outcome["outcome"]))
+            break
+    if outcome["outcome"] == "not_found" and log:
+        log("TS[%s] no cause found; %d checks run."
+            % (area_id, len(results)))
+    return outcome
+
+
+def verify_troubleshoot(outcome, env):
+    """Re-run the cause's check after a fix. -> (passed, evidence).
+
+    passed is True only if the check no longer fails AND no longer
+    produces the cause — reported truthfully either way.
+    """
+    cause = outcome.get("cause") or {}
+    check_id = cause.get("verify_check")
+    if not check_id or check_id not in TS_CHECKS:
+        return None, "no re-check is defined for this cause"
+    _title, fn = TS_CHECKS[check_id]
+    res = fn(env, [])
+    passed = res["status"] in ("pass", "info") and not res.get("cause")
+    return passed, res["evidence"]
+
+
+def cause_to_findings(outcome):
+    """Build Finding objects for a fixable outcome's fixes, so the
+    existing plan machinery (restore-point gate, verify_step) runs
+    them unchanged."""
+    cause = outcome.get("cause") or {}
+    flow = TROUBLESHOOT_FLOWS[outcome["area"]]
+    out = []
+    for fx in cause.get("fixes") or []:
+        out.append(Finding(
+            flow["category"], cause["title"],
+            detail=cause["explanation"],
+            fix_label=fx["label"], fix_kind=fx["kind"],
+            payload=fx.get("payload") or {}, severity="warn"))
+    return out
+
+
+# ---- real probes (Windows) -------------------------------------------
+
+def _events_probe_ps(days, provider_like=None, max_events=500):
+    filt = ("@{ LogName = @('System','Application'); "
+            "Level = @(1, 2); StartTime = (Get-Date).AddDays(-%d) }"
+            % days)
+    where = ""
+    if provider_like:
+        where = (" | Where-Object { $_.ProviderName -like '*%s*' }"
+                 % provider_like.replace("'", "''"))
+    return ("Get-WinEvent -FilterHashtable %s -MaxEvents %d "
+            "-ErrorAction SilentlyContinue%s | Select-Object "
+            "ProviderName, Id, LevelDisplayName, Message | "
+            "ConvertTo-Json -Compress" % (filt, max_events, where))
+
+
+class WindowsProbes:
+    """The real env for the troubleshooter + preventative scans.
+
+    Every method returns parsed data or None/{} — never raises, never
+    invents. Off-Windows everything degrades to None/empty, and the
+    checks honestly report 'unknown'.
+    """
+
+    def __init__(self, log):
+        self.log = log
+
+    def sfc(self):
+        if not IS_WINDOWS:
+            return None
+        _rc, txt = run_cmd(["sfc", "/verifyonly"], timeout=1800,
+                           log=self.log)
+        res = parse_sfc(txt)
+        return None if res["status"] == "unknown" and \
+            "windows resource protection" not in txt.lower() else res
+
+    def dism(self):
+        if not IS_WINDOWS:
+            return None
+        _rc, txt = run_cmd(
+            ["DISM", "/Online", "/Cleanup-Image", "/CheckHealth"],
+            timeout=600, log=self.log)
+        return parse_dism(txt)
+
+    def services(self, names):
+        if not IS_WINDOWS:
+            return {}
+        joined = ",".join(names)
+        ok, txt = ps_json(
+            "Get-Service %s -ErrorAction SilentlyContinue | "
+            "Select-Object Name, DisplayName, Status, StartType | "
+            "ConvertTo-Json -Compress" % joined,
+            timeout=120, log=self.log)
+        return parse_service_states(txt) if ok else {}
+
+    def pending_reboot(self):
+        if not IS_WINDOWS:
+            return []
+        ok, txt = ps_json(
+            "$r = [ordered]@{}; "
+            "$r.cbs = Test-Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\"
+            "CurrentVersion\\Component Based Servicing\\"
+            "RebootPending'; "
+            "$r.wu = Test-Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\"
+            "CurrentVersion\\WindowsUpdate\\Auto Update\\"
+            "RebootRequired'; "
+            "$s = Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet"
+            "\\Control\\Session Manager' -Name "
+            "PendingFileRenameOperations -ErrorAction "
+            "SilentlyContinue; "
+            "$r.file_rename = $null -ne $s; "
+            "$r.computer_rename = $false; "
+            "[pscustomobject]$r | ConvertTo-Json -Compress",
+            timeout=120, log=self.log)
+        rows = parse_json_list(txt) if ok else []
+        return parse_pending_reboot(rows[0] if rows else {})
+
+    def defender(self):
+        if not IS_WINDOWS:
+            return {"present": False}
+        ok, txt = ps_json(DEFENDER_STATUS_PS, timeout=120,
+                          log=self.log)
+        return parse_defender_status(
+            extract_json_text(txt) or txt) if ok else \
+            {"present": False}
+
+    def firewall(self):
+        if not IS_WINDOWS:
+            return []
+        ok, txt = ps_json(
+            "Get-NetFirewallProfile | Select-Object Name, Enabled | "
+            "ConvertTo-Json -Compress", timeout=120, log=self.log)
+        return parse_firewall_profiles(txt) if ok else []
+
+    def exclusions(self):
+        if not IS_WINDOWS:
+            return []
+        ok, txt = ps_json(
+            "Get-MpPreference | Select-Object ExclusionPath, "
+            "ExclusionExtension, ExclusionProcess, ExclusionIpAddress"
+            " | ConvertTo-Json -Compress", timeout=120, log=self.log)
+        return parse_defender_exclusions(txt) if ok else []
+
+    def threats(self):
+        if not IS_WINDOWS:
+            return []
+        ok, txt = ps_json(
+            "Get-MpThreatDetection | Select-Object ThreatID, "
+            "InitialDetectionTime, ThreatStatusID, Resources | "
+            "ConvertTo-Json -Compress", timeout=120, log=self.log)
+        return parse_threat_detections(txt) if ok else []
+
+    def events(self, days, provider_like=None):
+        if not IS_WINDOWS:
+            return []
+        ok, txt = ps_json(_events_probe_ps(days, provider_like),
+                          timeout=300, log=self.log)
+        events = parse_json_list(extract_json_text(txt)) if ok else []
+        for ev in events:
+            if ev.get("Message"):
+                ev["Message"] = str(ev["Message"])[:500]
+        return events
+
+    def boot(self):
+        if not IS_WINDOWS:
+            return None
+        ok, txt = ps_json(BOOT_EVENTS_PS, timeout=300, log=self.log)
+        return parse_boot_events(txt) if ok else None
+
+    def startup_items(self):
+        if not IS_WINDOWS:
+            return {"total": 0, "missing": [], "console": []}
+        items = []
+        for v in enum_run_values():
+            items.append({
+                "name": v["name"], "source": "Registry Run key",
+                "command": v["command"],
+                "disable": {"mode": "run_value", "key": v["key"],
+                            "name": v["name"]}})
+        total = 0
+        missing, console = [], []
+        for item in items:
+            total += 1
+            flags = classify_startup_item(item)
+            if flags["target_missing"]:
+                missing.append({"name": item["name"],
+                                "disable": item["disable"]})
+            elif flags["is_console"]:
+                console.append({"name": item["name"],
+                                "disable": item["disable"]})
+        return {"total": total, "missing": missing,
+                "console": console}
+
+    def disk_health(self):
+        if not IS_WINDOWS:
+            return []
+        ok, txt = ps_json(
+            "Get-PhysicalDisk | Select-Object FriendlyName, "
+            "MediaType, HealthStatus, OperationalStatus, Size | "
+            "ConvertTo-Json -Compress", timeout=120, log=self.log)
+        return parse_json_list(txt) if ok else []
+
+    def smart_predict(self):
+        if not IS_WINDOWS:
+            return None
+        ok, txt = ps_json(
+            "Get-CimInstance -Namespace root\\wmi -ClassName "
+            "MSStorageDriver_FailurePredictStatus | Select-Object "
+            "InstanceName, PredictFailure | ConvertTo-Json "
+            "-Compress", timeout=120, log=self.log)
+        return parse_smart_predict(txt) if ok else None
+
+    def volumes(self):
+        if not IS_WINDOWS:
+            return []
+        ok, txt = ps_json(
+            "Get-Volume | Where-Object DriveLetter | Select-Object "
+            "DriveLetter, FileSystemLabel, Size, SizeRemaining | "
+            "ConvertTo-Json -Compress", timeout=120, log=self.log)
+        return parse_json_list(txt) if ok else []
+
+    def junk_sizes(self):
+        out = {}
+        if not IS_WINDOWS:
+            return out
+        for key, _label, path, kind in junk_locations():
+            if kind == "cleanup_temp":
+                size, _cap = dir_size(path)
+                if size:
+                    out[key] = size
+        return out
+
+    def problem_devices(self):
+        if not IS_WINDOWS:
+            return []
+        ok, txt = ps_json(
+            "Get-CimInstance Win32_PnPEntity | Where-Object { "
+            "$_.ConfigManagerErrorCode -ne 0 } | Select-Object Name, "
+            "PNPClass, ConfigManagerErrorCode | ConvertTo-Json "
+            "-Compress", timeout=180, log=self.log)
+        return parse_problem_devices(txt) if ok else []
+
+    def memory_diag(self):
+        if not IS_WINDOWS:
+            return None
+        events = self.events(365, provider_like="MemoryDiagnostics")
+        if not events:
+            return {"ran": False, "failed": None}
+        failed = any("hardware problems" in (ev.get("Message") or "")
+                     .lower() for ev in events)
+        return {"ran": True, "failed": failed}
+
+    def adapters(self):
+        if not IS_WINDOWS:
+            return None
+        ok, txt = ps_json(
+            "Get-NetAdapter | Select-Object Name, Status, "
+            "LinkSpeed, InterfaceDescription | ConvertTo-Json "
+            "-Compress", timeout=120, log=self.log)
+        return parse_net_adapters(txt) if ok else None
+
+    def ping_gateway(self):
+        if not IS_WINDOWS:
+            return None
+        ok, txt = ps_json(
+            "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' "
+            "-ErrorAction SilentlyContinue | Sort-Object "
+            "RouteMetric | Select-Object -First 1).NextHop",
+            timeout=60, log=self.log)
+        gateway = (txt or "").strip().splitlines()
+        gateway = gateway[-1].strip() if gateway else ""
+        if not gateway:
+            return None
+        _rc, out = run_cmd(["ping", "-n", "2", "-w", "1500", gateway],
+                           timeout=60, log=self.log)
+        return parse_ping(out)
+
+    def dns_lookup(self):
+        if not IS_WINDOWS:
+            return None
+        _rc, out = run_cmd(["nslookup", "www.microsoft.com"],
+                           timeout=60, log=self.log)
+        return parse_nslookup(out)
+
+    def proxy(self):
+        if not IS_WINDOWS:
+            return None
+        val = reg_get_value(
+            ROOTS["HKCU"],
+            r"Software\Microsoft\Windows\CurrentVersion\Internet "
+            r"Settings", "ProxyEnable")
+        server = reg_get_value(
+            ROOTS["HKCU"],
+            r"Software\Microsoft\Windows\CurrentVersion\Internet "
+            r"Settings", "ProxyServer")
+        return {"enabled": bool(val), "server": str(server or "")}
+
+    def audio(self):
+        if not IS_WINDOWS:
+            return {"services": {}, "devices": [], "endpoints": [],
+                    "problem_devices": []}
+        states = self.services(["audiosrv", "audioendpointbuilder"])
+        ok, txt = ps_json(
+            "Get-CimInstance Win32_SoundDevice | Select-Object "
+            "Name, Status | ConvertTo-Json -Compress",
+            timeout=120, log=self.log)
+        devices = parse_sound_devices(txt) if ok else []
+        ok2, txt2 = ps_json(
+            "Get-PnpDevice -Class AudioEndpoint -ErrorAction "
+            "SilentlyContinue | Select-Object FriendlyName, Status, "
+            "Problem | ConvertTo-Json -Compress",
+            timeout=120, log=self.log)
+        endpoints = parse_json_list(
+            extract_json_text(txt2)) if ok2 else []
+        problems = [d for d in self.problem_devices()
+                    if (d.get("class") or "").upper() in
+                    ("MEDIA", "AUDIOENDPOINT")]
+        return {"services": states, "devices": devices,
+                "endpoints": endpoints, "problem_devices": problems}
+
+    def wu_search(self):
+        if not IS_WINDOWS:
+            return None
+        script = (
+            "$ErrorActionPreference = 'Stop'; try { "
+            "$session = New-Object -ComObject "
+            "Microsoft.Update.Session; "
+            "$searcher = $session.CreateUpdateSearcher(); "
+            "$result = $searcher.Search(\"Type='Software' and "
+            "IsInstalled=0 and IsHidden=0\"); "
+            "[pscustomobject]@{ Count = $result.Updates.Count } | "
+            "ConvertTo-Json -Compress } catch { "
+            "[pscustomobject]@{ Error = $_.Exception.Message } | "
+            "ConvertTo-Json -Compress }")
+        ok, txt = ps_json(script, timeout=900, log=self.log)
+        rows = parse_json_list(extract_json_text(txt)) if ok else []
+        if not rows:
+            return {"ok": False, "error": "search did not answer"}
+        if rows[0].get("Error"):
+            return {"ok": False, "error": str(rows[0]["Error"])}
+        count = parse_wu_pending_count(txt)
+        return {"ok": count is not None, "count": count,
+                "error": None if count is not None else
+                "could not read the update count"}
+
+
+# ----------------------------------------------------------------------
+# Preventative scans (v1.1.0) — periodic measurements, evaluated pure:
+# raw data in -> findings + change lines out. History is stored so
+# each scan can say what CHANGED, not just what is true right now.
+# Every attention finding carries a troubleshooter area.
+# ----------------------------------------------------------------------
+
+PREVENTATIVE_FILE = "preventative-history.json"
+EVENT_PATTERN_WATCH = (
+    ("disk", (7, 11, 51, 129), "Disk errors (bad blocks / controller)",
+     "disk"),
+    ("ntfs", (55,), "File-system corruption (NTFS 55)", "disk"),
+    ("whea-logger", None, "Hardware errors (WHEA)", "crashes"),
+    ("service control manager", (7000, 7001, 7031, 7034),
+     "Repeated service failures", "crashes"),
+)
+
+
+def select_event_patterns(grouped):
+    """grouped events -> watched patterns that fired (>=1 disk/WHEA,
+    >=3 service failures — one service hiccup is noise)."""
+    out = []
+    for sub, ids, label, area in EVENT_PATTERN_WATCH:
+        count = 0
+        for g in grouped or []:
+            if sub in (g.get("provider") or "").lower():
+                if ids is None or g.get("id") in ids:
+                    count += g.get("count") or 0
+        threshold = 3 if sub == "service control manager" else 1
+        if count >= threshold:
+            out.append({"key": sub, "label": label, "count": count,
+                        "area": area})
+    return out
+
+
+def evaluate_preventative(data, prev=None):
+    """Pure: measurements -> (issues, changes).
+
+    issue: {key, severity, title, detail, area}
+    changes: plain-language lines vs the previous scan's data.
+    """
+    issues = []
+    changes = []
+    prev = prev or {}
+    # SMART + disk health.
+    for p in data.get("smart") or []:
+        if p.get("predict_failure"):
+            issues.append({
+                "key": "smart:%s" % p.get("instance"),
+                "severity": "bad",
+                "title": "SMART predicts failure: %s"
+                         % p.get("instance"),
+                "detail": "The drive's own diagnostics predict "
+                          "failure. Back up now, replace the drive.",
+                "area": "disk"})
+    for d in data.get("disks") or []:
+        if str(d.get("HealthStatus") or "").lower() != "healthy":
+            issues.append({
+                "key": "disk-health:%s" % d.get("FriendlyName"),
+                "severity": "bad",
+                "title": "Disk not healthy: %s (%s)"
+                         % (d.get("FriendlyName"),
+                            d.get("HealthStatus")),
+                "detail": "Windows' storage health report flags "
+                          "this drive.", "area": "disk"})
+    # Volumes: level + change since last scan.
+    prev_vols = {v.get("DriveLetter"): v
+                 for v in prev.get("volumes") or []}
+    for v in data.get("volumes") or []:
+        letter = v.get("DriveLetter")
+        size = v.get("Size") or 0
+        free = v.get("SizeRemaining") or 0
+        pct = (100.0 * free / size) if size else 0
+        if pct < 5:
+            issues.append({
+                "key": "space:%s" % letter, "severity": "bad",
+                "title": "Drive %s: is nearly full (%.0f%% free)"
+                         % (letter, pct),
+                "detail": "A nearly-full system drive breaks "
+                          "updates and slows Windows.",
+                "area": "disk"})
+        elif pct < 10:
+            issues.append({
+                "key": "space:%s" % letter, "severity": "warn",
+                "title": "Drive %s: is filling up (%.0f%% free)"
+                         % (letter, pct),
+                "detail": "Worth clearing before it becomes a "
+                          "problem.", "area": "disk"})
+        pv = prev_vols.get(letter)
+        if pv is not None:
+            delta = free - (pv.get("SizeRemaining") or 0)
+            if abs(delta) >= 2 * 1024 ** 3:
+                changes.append(
+                    "Drive %s: free space %s by %s since last "
+                    "check (now %s free)."
+                    % (letter, "grew" if delta > 0 else "dropped",
+                       human_size(abs(delta)), human_size(free)))
+    # Defender.
+    st = data.get("defender") or {}
+    if st.get("present"):
+        if not st.get("rtp"):
+            issues.append({
+                "key": "defender-rtp", "severity": "bad",
+                "title": "Defender real-time protection is OFF",
+                "detail": "Malware is only caught during scans "
+                          "while this is off.", "area": "security"})
+        age = st.get("sig_age_days")
+        if age is not None and age > 7:
+            issues.append({
+                "key": "defender-sig", "severity": "bad",
+                "title": "Defender signatures are %d days old"
+                         % age,
+                "detail": "Old signatures miss new malware.",
+                "area": "security"})
+        elif age is not None and age > 2:
+            issues.append({
+                "key": "defender-sig", "severity": "warn",
+                "title": "Defender signatures are %d days old"
+                         % age,
+                "detail": "Update them from the Security section.",
+                "area": "security"})
+    elif data.get("defender") is not None:
+        issues.append({
+            "key": "defender-absent", "severity": "warn",
+            "title": "Defender status could not be read",
+            "detail": "A third-party antivirus may be managing "
+                      "protection instead.", "area": "security"})
+    # Firewall.
+    for p in data.get("firewall") or []:
+        if not p.get("enabled"):
+            issues.append({
+                "key": "firewall:%s" % p.get("name"),
+                "severity": "bad",
+                "title": "Firewall is OFF for the %s profile"
+                         % p.get("name"),
+                "detail": "The firewall should be on for every "
+                          "profile.", "area": "security"})
+    # Pending updates.
+    pending = data.get("pending_updates")
+    if pending is not None:
+        if pending >= 10:
+            issues.append({
+                "key": "pending-updates", "severity": "warn",
+                "title": "%d Windows updates are waiting" % pending,
+                "detail": "A backlog that large usually means one "
+                          "is stuck.", "area": "update"})
+        elif pending >= 1:
+            issues.append({
+                "key": "pending-updates", "severity": "info",
+                "title": "%d Windows update(s) waiting" % pending,
+                "detail": "Install them when convenient.",
+                "area": "update"})
+        pp = prev.get("pending_updates")
+        if pp is not None and pp != pending:
+            changes.append("Pending updates: %d now, was %d."
+                           % (pending, pp))
+    # Startup changes.
+    names = data.get("startup_names") or []
+    prev_names = prev.get("startup_names")
+    if prev_names is not None:
+        added = [n for n in names if n not in prev_names]
+        removed = [n for n in prev_names if n not in names]
+        if added:
+            changes.append("New startup program(s): %s."
+                           % ", ".join(added))
+            issues.append({
+                "key": "startup-changed", "severity": "info",
+                "title": "New startup program(s): %s"
+                         % ", ".join(added),
+                "detail": "New since the last check. Fine if you "
+                          "installed something on purpose; worth a "
+                          "look if you didn't.", "area": "slow_startup"})
+        if removed:
+            changes.append("Startup program(s) gone: %s."
+                           % ", ".join(removed))
+    # Event patterns.
+    prev_patterns = {p.get("key")
+                     for p in prev.get("event_patterns") or []}
+    for p in data.get("event_patterns") or []:
+        issues.append({
+            "key": "events:%s" % p.get("key"),
+            "severity": "warn",
+            "title": "%s — %d in the last 30 days"
+                     % (p.get("label"), p.get("count") or 0),
+            "detail": "A repeated pattern in the event log, not a "
+                      "one-off.",
+            "area": p.get("area")})
+        if p.get("key") not in prev_patterns and prev:
+            changes.append("New pattern since last check: %s."
+                           % p.get("label"))
+    # Restore point age.
+    rp_age = data.get("restore_point_age_days")
+    if "restore_point_age_days" in data and rp_age is None:
+        issues.append({
+            "key": "restore-none", "severity": "warn",
+            "title": "No restore points exist",
+            "detail": "Restore points are the undo button for "
+                      "system changes.", "area": None})
+    elif rp_age is not None and rp_age > 30:
+        issues.append({
+            "key": "restore-old", "severity": "warn",
+            "title": "Newest restore point is %d days old"
+                     % int(rp_age),
+            "detail": "This app creates a fresh one before any "
+                      "fix regardless.", "area": None})
+    return issues, changes
+
+
+def gather_preventative(log):
+    """Collect the raw measurements (Windows only; None elsewhere)."""
+    if not IS_WINDOWS:
+        return None
+    probes = WindowsProbes(log)
+    data = {"collected_at": datetime.datetime.now().isoformat(
+        timespec="seconds")}
+    data["disks"] = probes.disk_health()
+    data["smart"] = probes.smart_predict()
+    data["volumes"] = probes.volumes()
+    data["defender"] = probes.defender()
+    data["firewall"] = probes.firewall()
+    search = probes.wu_search()
+    data["pending_updates"] = (search or {}).get("count") \
+        if search and search.get("ok") else None
+    ok, txt = ps_json(
+        "Get-CimInstance Win32_StartupCommand | Select-Object Name "
+        "| ConvertTo-Json -Compress", timeout=180, log=log)
+    names = []
+    for row in parse_json_list(txt) if ok else []:
+        if row.get("Name"):
+            names.append(str(row["Name"]))
+    data["startup_names"] = sorted(names)
+    events = probes.events(30)
+    data["event_patterns"] = select_event_patterns(
+        group_events(events))
+    age_hours = latest_restore_point_age_hours(log)
+    data["restore_point_age_days"] = (age_hours / 24.0
+                                       if age_hours is not None
+                                       else None)
+    return data
+
+
+def preventative_path():
+    return os.path.join(app_dir(), PREVENTATIVE_FILE)
+
+
+def load_preventative_history(path=None):
+    try:
+        with open(path or preventative_path(), "r",
+                  encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {"scans": []}
+    except (OSError, ValueError):
+        return {"scans": []}
+
+
+def record_preventative(data, path=None):
+    """Append a scan to the history; return the previous scan's data
+    (or None). Keeps the last 24."""
+    hist = load_preventative_history(path)
+    scans = hist.get("scans") or []
+    prev = scans[-1]["data"] if scans else None
+    scans.append({"when": data.get("collected_at"), "data": data})
+    hist["scans"] = scans[-24:]
+    try:
+        with open(path or preventative_path(), "w",
+                  encoding="utf-8") as fh:
+            json.dump(hist, fh, indent=1)
+    except OSError:
+        pass
+    return prev
+
+
+def build_preventative_findings(data, prev):
+    """(findings, changes, attention_count) for display."""
+    issues, changes = evaluate_preventative(data, prev)
+    findings = []
+    when = (data.get("collected_at") or "")[:10]
+    detail = "\n".join(changes) if changes else (
+        "First preventative scan — future scans will show what "
+        "changed." if not prev else
+        "Nothing changed since the last check.")
+    findings.append(Finding(
+        "preventative", "Preventative check (%s)" % when,
+        detail=detail, severity="info"))
+    for issue in issues:
+        findings.append(Finding(
+            "preventative", issue["title"], detail=issue["detail"],
+            why="Found by the preventative check. Use the "
+                "'Troubleshoot this' button for a step-by-step "
+                "diagnosis." if issue.get("area") else "",
+            payload={"ts_area": issue["area"]}
+            if issue.get("area") else {},
+            severity=issue["severity"]))
+    attention = sum(1 for i in issues
+                    if i["severity"] in ("warn", "bad"))
+    return findings, changes, attention
+
+
+# ---- auto-check schedule: weekly OR monthly (monthly = default) -----
+
+AUTO_CHECK_FILE = "auto-check.json"
+AUTO_CHECK_MODES = ("weekly", "monthly")
+
+
+def auto_check_path():
+    return os.path.join(app_dir(), AUTO_CHECK_FILE)
+
+
+def auto_check_mode(path=None):
+    try:
+        with open(path or auto_check_path(), "r",
+                  encoding="utf-8") as fh:
+            mode = json.load(fh).get("mode")
+        return mode if mode in AUTO_CHECK_MODES else "monthly"
+    except (OSError, ValueError, AttributeError):
+        return "monthly"
+
+
+def save_auto_check_mode(mode, path=None):
+    if mode not in AUTO_CHECK_MODES:
+        raise ValueError("unknown auto-check mode: %s" % mode)
+    with open(path or auto_check_path(), "w",
+              encoding="utf-8") as fh:
+        json.dump({"mode": mode}, fh)
+    return mode
+
+
+def auto_check_schtasks_args(mode, action, task_name=None):
+    """Pure: the schtasks /Create argument list for a mode."""
+    args = ["/Create", "/TN", task_name or MONTHLY_TASK_NAME,
+            "/TR", action, "/ST", "09:00", "/F"]
+    if mode == "weekly":
+        args += ["/SC", "WEEKLY", "/D", "MON"]
+    else:
+        args += ["/SC", "MONTHLY", "/D", "1"]
+    return args
 
 
 # Feature-pack scanners register into SCANNERS in display order

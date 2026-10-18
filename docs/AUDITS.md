@@ -148,3 +148,120 @@ and queue-stop are unit-tested with mocked executors.
 - The `__main__` entry block sat mid-file after GUI work was appended;
   moved to the true end of file so script execution reaches every
   definition.
+
+---
+
+## Addendum 2026-10-17 — v1.1.0: troubleshooter, preventative scans,
+## and the Defender/Malwarebytes visibility audit
+
+### A. Why v1.0.0's Defender section + Malwarebytes suggestion were
+###    invisible on Shawn's real PC (audit of the shipped code path)
+
+The features exist in v1.0.0 code and pass fixture tests, but the
+shipped flow buries or loses them. Findings, from reading the code:
+
+1. **One flat list, no security summary.** Defender status and the
+   Malwarebytes suggestion are ordinary rows in the same tree as ~40
+   other findings. There is no "Windows Security" panel or summary
+   line, so a user looking for "the app using my antivirus" sees
+   undifferentiated text rows.
+2. **Defender actions are conditional, so on a healthy PC almost none
+   show.** "Update signatures" is only offered when signatures are
+   >2 days old; "enable real-time protection" only when RTP is off.
+   On a healthy machine the ONLY Defender action in the whole app is
+   the quick-scan row, mid-list. There is no "Open Windows Security"
+   action anywhere in v1.0.0.
+3. **The Malwarebytes card is one `info` row near the END of the
+   Security category**, after Defender, exclusions, firewall and
+   SmartScreen rows. Its download button exists only as a detail-pane
+   action: it materializes only when that exact row is clicked, and
+   the row title never says a download is behind it.
+4. **Single point of failure.** `run_scan` catches exceptions per
+   scanner, so ANY exception inside `scan_security` (registry read,
+   uninstall enumeration, a parser edge) collapses the ENTIRE
+   category — Defender status AND the Malwarebytes suggestion — into
+   one "This check failed to run" row.
+5. **Brittle JSON path.** `ps_json` requires exit code 0 AND clean
+   JSON. First-run PowerShell noise (module-load progress text) or a
+   non-terminating error makes `parse_json_list` return [], which
+   `parse_defender_status` reports as "could not read" — one vague
+   warning row, no partial status, no reason detail.
+6. **Malwarebytes launch detection is thin**: it only probes two exe
+   names inside the registry InstallLocation; a miss degrades to
+   "launch it from the Start menu" with no button at all.
+
+v1.1.0 fixes all six: a Defender summary line leads the category,
+per-part failure isolation inside the security scan, a noise-tolerant
+JSON extractor for the Defender status path, always-offered Defender
+actions (quick scan, signature update, Open Windows Security), the
+Malwarebytes card directly under the Defender summary with its
+official-site button, and standard-install-path exe probing.
+
+### B. Change-impact audit — v1.1.0
+
+**What is being added** (per Shawn, 2026-10-17): (A) a systematic
+troubleshooter — pick a problem area, run ordered REAL checks
+cheap→deep, end in exactly one honest outcome (safe fix under the
+existing restore-point gate with post-fix re-verification / a
+step-by-step plain-language guide / "cause not found" with what was
+ruled out); (B) an expanded verifiable safe-fix set (WU cache reset
+with the old cache renamed as backup, DNS flush, a start-a-disabled-
+service fix); (C) preventative scans (SMART incl. failure prediction,
+free-space trend, Defender signature age/state, firewall, pending
+update count, startup changes, watched event-log patterns,
+restore-point age) with stored history, a "what changed / what needs
+attention" report, findings routing into the troubleshooter, and a
+weekly-or-monthly schedule choice (monthly stays default);
+(D) flow/scan logging in the app's existing log style.
+
+**Blast radius:**
+- `windows_health.py` only, plus tests/fixtures, README,
+  BUILD-STATUS, packaging version strings (1.0.0 → 1.1.0 in
+  app-config.json, version_info.txt, APP_VERSION — the packaging
+  validator enforces the three agree).
+- All v1.0.0 scanners, the 3-class registry rules, the fix-plan gate,
+  driver gates, and the certificate rubric are untouched. New fix
+  kinds are appended to FIX_ORDER; existing kinds keep their order
+  values.
+- New on-disk state next to the app: `preventative-history.json`,
+  `auto-check.json` (schedule mode), service-start backups under
+  `backups/`. The WU reset RENAMES the download cache instead of
+  deleting it — the old cache stays as the backup until the user
+  deletes it.
+- The troubleshooter reuses `build_fix_plan`/`execute_plan`, so the
+  restore-point hard gate, driver gates and verification notes apply
+  identically. No new network calls except the ones Windows itself
+  makes (WU search, signature update) — same as v1.0.0.
+
+**Alternatives considered:**
+- A separate troubleshooter executable — rejected: one app, one
+  installer, one safety model.
+- Free-form "AI diagnosis" text — rejected: causes must come from
+  real probe evidence; a cause the checks didn't produce is never
+  printed (the v1 honesty rule, extended).
+
+### C. Pre-build audit — v1.1.0
+
+- *Probe layer:* every troubleshooter check reads through an `env`
+  probe object; unit tests inject a fake env, so flow logic (order,
+  stop-at-first-cause, outcome selection, post-fix verification) is
+  fully tested off-Windows. Windows probes wrap the existing parsers
+  and degrade to `unknown` evidence, never invented results.
+- *Fix safety:* the three new fix kinds follow the house pattern —
+  pre-state recorded (service start type saved to a backup JSON; WU
+  cache renamed, not deleted; DNS flush has nothing persistent to
+  back up and says so), services restarted in `finally` blocks,
+  and a `verify_step` branch re-probes the fixed thing.
+- *Preventative evaluation is pure:* raw measurements in, findings +
+  change lines out; history is a JSON file with the last 24 scans.
+  The scheduled `--scan-only` run collects the same data and appends
+  the preventative section to its report; headless runs still never
+  fix anything.
+- *Schedule change:* the Task Scheduler job keeps its existing name
+  (renaming would orphan the v1.0.0 task on user PCs); only its
+  /SC trigger changes (MONTHLY /D 1 vs WEEKLY /D MON) per the saved
+  mode. Default remains monthly.
+- *GUI:* troubleshooter opens as its own resizable Toplevel window
+  (minsize set) so the main window layout — and its GUI-contract
+  test — is undisturbed. Long flows run on worker threads like the
+  main scan.

@@ -195,6 +195,78 @@ BOOT_EVENTS_JSON = (
     '"61000", "Name": null, "TotalTime": null, '
     '"DegradationTime": null}]')
 
+# --- v1.1.0: security restructure / troubleshooter / preventative --------
+DEFENDER_STATUS_NOISY = (
+    "Preparing modules for first use.\r\n"
+    '{"AMServiceEnabled":true,"AMRunningMode":"Normal",'
+    '"AntivirusEnabled":true,"RealTimeProtectionEnabled":true,'
+    '"IoavProtectionEnabled":true,"IsTamperProtected":true,'
+    '"AntivirusSignatureVersion":"1.453.123.0",'
+    '"AntivirusSignatureAge":0,'
+    '"QuickScanEndTime":"/Date(1760313600000)/",'
+    '"FullScanEndTime":null,"QuickScanNeeded":false,'
+    '"FullScanNeeded":false}\r\n')
+
+NSLOOKUP_OK = (
+    "Server:  router.local\r\nAddress:  192.168.1.1\r\n\r\n"
+    "Non-authoritative answer:\r\nName:    www.microsoft.com\r\n"
+    "Address:  20.236.44.162\r\n")
+
+NSLOOKUP_FAIL = "*** router.local can't find www.microsoft.com: " \
+                "Server failed\r\n"
+
+PING_OK = (
+    "Pinging 192.168.1.1 with 32 bytes of data:\r\n"
+    "Reply from 192.168.1.1: bytes=32 time=1ms TTL=64\r\n"
+    "Reply from 192.168.1.1: bytes=32 time=1ms TTL=64\r\n\r\n"
+    "Ping statistics for 192.168.1.1:\r\n"
+    "    Packets: Sent = 2, Received = 2, Lost = 0 (0% loss),\r\n")
+
+PING_FAIL = (
+    "Pinging 192.168.1.1 with 32 bytes of data:\r\n"
+    "Request timed out.\r\nRequest timed out.\r\n\r\n"
+    "Ping statistics for 192.168.1.1:\r\n"
+    "    Packets: Sent = 2, Received = 0, Lost = 2 (100% loss),\r\n")
+
+NET_ADAPTERS_JSON = (
+    '[{"Name":"Wi-Fi","Status":"Up","LinkSpeed":"866 Mbps",'
+    '"InterfaceDescription":"Intel Wireless-AC 9560"},'
+    '{"Name":"Ethernet","Status":"Disconnected","LinkSpeed":"0 bps",'
+    '"InterfaceDescription":"Realtek GbE"}]')
+
+SOUND_DEVICES_JSON = (
+    '[{"Name":"Realtek High Definition Audio","Status":"OK"}]')
+
+SMART_PREDICT_JSON = (
+    '[{"InstanceName":"SCSI\\\\Disk&Ven_NVMe\\\\0",'
+    '"PredictFailure":false},'
+    '{"InstanceName":"SCSI\\\\Disk&Ven_WDC\\\\1",'
+    '"PredictFailure":true}]')
+
+WU_PENDING_JSON = '{"Count": 5}'
+
+BUGCHECK_EVENTS = [
+    {"ProviderName": "Microsoft-Windows-WER-SystemErrorReporting",
+     "Id": 1001, "LevelDisplayName": "Error",
+     "Message": "The computer has rebooted from a bugcheck. The "
+                "bugcheck was: 0x000000d1 (0x0000000000000028)."},
+    {"ProviderName": "Microsoft-Windows-WER-SystemErrorReporting",
+     "Id": 1001, "LevelDisplayName": "Error",
+     "Message": "The computer has rebooted from a bugcheck. The "
+                "bugcheck was: 0x000000d1 (0x0000000000000028)."},
+]
+
+WU_FAIL_EVENTS = [
+    {"ProviderName": "Microsoft-Windows-WindowsUpdateClient",
+     "Id": 20, "LevelDisplayName": "Error",
+     "Message": "Installation Failure: Windows failed to install "
+                "the following update with error 0x80070422: "
+                "Feature update."},
+    {"ProviderName": "Microsoft-Windows-WindowsUpdateClient",
+     "Id": 31, "LevelDisplayName": "Error",
+     "Message": "Windows Update failed to download an update."},
+]
+
 # --- installed programs ----------------------------------------------------
 PROGRAMS_JSON = (
     '[{"DisplayName": "Useful App", "DisplayVersion": "3.2", '

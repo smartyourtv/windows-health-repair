@@ -312,8 +312,16 @@ unexpected failure is logged, crash-reported, dialogued, and always
 clears the busy state.
 
 Tests: **154 unit** (147 + 7 new TestScanHangRegression) /
-**63 self-test** / **42 packaging** — green locally; CI must
-reproduce on windows-latest before release.
+**63 self-test** / **42 packaging** — green locally and in CI
+(run 39423127329, SUCCESS).
+
+Release: GitHub release **v1.2.1** (published, not draft).
+WindowsHealthRepair-Setup.exe = **14,120,461 bytes**,
+SHA-256 `b36f3d03310292716f6ff39f42dbb8bd8deaf13a202398ce6e21e8e13aa657c5`,
+MD5 `8cf88d28d3ee187bada244a2091ff0aa` (downloaded and hash-verified
+against GitHub's recorded digest). Drive file
+`WindowsHealthRepair-Setup.exe` (ID 1dyC6B82FdFntVJVbQnFlXj3n9KoVtDe_)
+updated IN PLACE to the same bytes (post-upload size + MD5 verified).
 
 Honest limits: not proven on real Windows — the owner's install
 (v1.1.1 → v1.2.1 via the in-app updater or the Drive setup file)

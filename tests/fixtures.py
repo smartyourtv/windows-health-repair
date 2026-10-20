@@ -138,6 +138,37 @@ THREATS_JSON = (
     '"ThreatStatusID":3,"Resources":["file:_C:\\\\x\\\\bad.exe"]}]'
 )
 
+# --- v1.2.0: Defender scan set + threat history -------------------------
+THREAT_NAMES_JSON = (
+    '[{"ThreatID":2147735505,"ThreatName":"Trojan:Win32/Wacatac.B!ml",'
+    '"SeverityID":5,"CategoryID":8},'
+    '{"ThreatID":2147732267,"ThreatName":"PUA:Win32/Packunwan",'
+    '"SeverityID":1,"CategoryID":27}]'
+)
+
+THREATS_ACTIVE_JSON = (
+    '[{"ThreatID":2147735505,'
+    '"InitialDetectionTime":"/Date(1760313600000)/",'
+    '"ThreatStatusID":1,"ActionSuccess":false,'
+    '"Resources":["file:_C:\\\\x\\\\bad.exe"]}]'
+)
+
+THREATS_MIXED_JSON = (
+    '[{"ThreatID":2147735505,'
+    '"InitialDetectionTime":"/Date(1760313600000)/",'
+    '"ThreatStatusID":1,"ActionSuccess":false,'
+    '"Resources":["file:_C:\\\\x\\\\bad.exe"]},'
+    '{"ThreatID":2147732267,'
+    '"InitialDetectionTime":"/Date(1760227200000)/",'
+    '"ThreatStatusID":4,"ActionSuccess":true,'
+    '"Resources":["file:_C:\\\\y\\\\pup.exe"]}]'
+)
+
+DEFENDER_PREFERENCE_ACTIONS_JSON = (
+    '{"ThreatIDDefaultAction_Ids":[2147735505],'
+    '"ThreatIDDefaultAction_Actions":[2]}'
+)
+
 RESTORE_POINTS_JSON = (
     '[{"Created":"20261015093000.000000-420",'
     '"Description":"Windows Update"},'

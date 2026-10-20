@@ -420,3 +420,109 @@ no duplicate machinery.
   (131 + 16 new), self-test 63/63 (56 + 7 new), packaging
   42/42. CI must reproduce all three on windows-latest before
   any release is published.
+
+---
+
+# Addendum — 2026-10-20: scan-hang forensic + general audit (v1.2.1)
+
+Triggered by the owner's report: "Scan this PC" started 2026-10-19
+18:06:13; at 21:44 the window still showed "Scanning... SFC/DISM
+checks can take several minutes." with a completely empty findings
+list (~3.5 h). Owner runs v1.1.1; the defect is present unchanged in
+the v1.2.0 tree.
+
+## Forensic findings — the hang
+
+**Root cause (proven, reproduced): name shadowing in the scan
+progress callback.** `do_scan` (windows_health.py:4192) defines a
+nested `def progress(cat, i, total)` whose body subscripts
+`progress["maximum"]` / `progress["value"]`. That shadows the
+`ttk.Progressbar` named `progress` in the enclosing GUI scope (line
+3949), so inside the callback `progress` is the *function object* and
+the first call raises `TypeError: 'function' object does not support
+item assignment`. Reproduced off-Windows with a semantic replica of
+the nesting (a dict standing in for the widget): same TypeError.
+
+Failure chain: `run_scan` invokes the progress callback *before* the
+first scanner (line 2378, outside its per-scanner try/except). The
+TypeError kills the worker thread; in the frozen windowed exe the
+threading excepthook writes to a stderr nobody sees. `populate()` and
+`set_busy(False)` are only reachable after `run_scan` returns, so the
+UI keeps the pre-scan state forever: the static busy label (whose text
+mentions SFC/DISM — a red herring; no check ever ran), an empty
+findings list, and a log containing only the header + "Scan started".
+
+**Same defect, fix path:** `confirm_and_run_plan`'s progress callback
+(line 4236) has the identical shadowing. `execute_plan` calls it
+before step zero, so any fix run in v1.1.1/v1.2.0 dies the same way —
+before the restore point is created. Fail-safe (nothing is changed)
+but fully broken.
+
+**Contributing design flaws:** (1) all-or-nothing rendering —
+findings reach the tree only via one `populate()` call after the
+whole scan; (2) neither worker has try/finally, so a dead worker
+leaves the busy state up with no error anywhere; (3) no watchdog or
+elapsed-time display naming the check in progress.
+
+**Ruled out / ruled down:** pipe-drain deadlock (`run_cmd` uses
+`subprocess.run(capture_output=True)`, which drains via communicate);
+missing timeouts (every command call carries one; the SFC/DISM check's
+worst case is 1800+600+1800 = 70 min and the all-scanner worst case
+is ~2.2 h, both under the observed 3.5 h, and each would still have
+produced log lines and earlier findings); console-input waits (none
+in the scan path); cross-thread Tk mutation (a real latent defect in
+the same two callbacks, but unreachable — the TypeError fires first;
+the fix therefore renames *and* marshals via `root.after`, matching
+the download progress callback at line ~4758, the one place that
+already did it correctly).
+
+**Confirming evidence on the owner's PC:** the scan log
+(`logs\health-20261019-180613.log`) should contain only the header
+and "Scan started" — no `$` command lines at all — proving no check
+ever ran.
+
+## General audit (standing areas)
+
+- *Permissions/elevation:* scanning needs no admin; every fix path
+  funnels through `confirm_and_run_plan`, which refuses without
+  admin and points at Relaunch-as-admin (ShellExecuteW "runas"). OK.
+- *Invariants hold:* `plan_is_safe` (line 620) + `execute_plan`'s
+  hard refusal (line 3262) keep the restore point at step zero;
+  `OPT_IN_KINDS` (line 587) covers net_reset/wsreset/defender_scan
+  and the v1.2.0 threat kinds; `Finding.default_checked` defaults
+  False (line 203); crash reports (in-app view + Downloads file) and
+  the self-repair event log cover the v1.2.0 code paths.
+- *Security:* updater still verifies the downloaded setup against
+  the expected SHA-256 (GitHub-reported digest or the .sha256 asset;
+  lines 4765, 8117-8119); no secrets; stdlib-only imports.
+- *Null/error handling:* `run_scan` isolates per-scanner exceptions
+  into honest "check failed" findings (lines 2381-2390); parsers
+  return []/{} on unparseable output (pinned by tests). The gap was
+  never in the scanners — it was in the GUI callbacks above them.
+- *Versions:* APP_VERSION, packaging/app-config.json and
+  packaging/version_info.txt in step (1.2.0 at audit time;
+  validate_packaging re-checks in CI).
+
+## Fixes shipped in v1.2.1
+
+1. Both progress callbacks renamed (`scan_progress`, `fix_progress`)
+   and marshaled to the UI thread with `root.after(0, ...)`; the
+   progressbar is reached through a UI-thread closure, never
+   shadowed, never touched from a worker.
+2. `run_scan` streams: new `on_findings(batch)` callback fires as
+   each check finishes, and the GUI appends findings to the tree
+   immediately (category sections appear as their check completes).
+   The list can never again sit empty through a long scan.
+3. Per-check log lines: "Check i/N: <title>" at start and
+   "Check <title> finished in Ns — M finding(s)." at end, so any
+   future stall is pinpointed by the log's last line.
+4. Watchdog: a 1-second UI ticker (guarded by a per-scan token)
+   shows the running check's name + elapsed time via the pure
+   `scan_status_text()` helper; past 3 minutes it adds a plain
+   "still running — this check has a time limit and will be
+   reported if it overruns" note.
+5. Both workers wrapped in try/except: an unexpected worker failure
+   is logged, written to the crash-report store, shown in a dialog,
+   and always clears the busy state.
+
+Not proven on real Windows — the owner's install remains the test.

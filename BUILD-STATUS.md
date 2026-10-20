@@ -236,3 +236,56 @@ suggestion on his PC — audited first, then made unmistakable
   restore point + same-run driver backup, one-at-a-time, one failure
   stops the queue — gates unit-tested with mocked executors.
 - Windows-only-to-verify list is in the README.
+
+---
+
+## v1.2.0 — Defender malware scans + threat history (2026-10-19)
+
+Phase 2 of the Scout security capability (laptop ClamAV = Phase 1,
+live in talk.py v1.3.14). Spec: scout-security-troubleshooting-design
+Phase 2. Audits: v1.2.0 change-impact + pre-build addenda in
+docs/AUDITS.md.
+
+What shipped:
+- Full Defender scan set, all through the restore-point-gated fix
+  plan: Quick, Full, Custom folder scan (GUI folder picker), and
+  Offline Scan — the offline finding states in its title that it
+  RESTARTS the PC and in its detail that the app cannot verify it;
+  verify_step says the same. Defender refusing to start a scan
+  because one is already running surfaces as an honest failure.
+- Threat history by name (Get-MpThreat joined onto detections):
+  Defender's own state per detection (detected/still needs action,
+  cleaned, quarantined, removed, allowed, blocked; unknown codes
+  printed raw). Newest 8 shown; a note keeps older counts honest.
+- Defender's own threat actions: Remove-MpThreat for anything
+  still active (result re-reads the active count), and a standing
+  Quarantine/Remove/Allow per named threat via
+  Set-MpPreference -ThreatIDDefaultAction_Ids/-Actions (codes read
+  back as raw numbers — Defender publishes no name table; refusal
+  text names Tamper Protection and offers no workaround).
+- Both new fix kinds are OPT_IN (never default-checked). The
+  troubleshooter's threats check stays guided and now points at
+  these actions. Signature state still shown with its real
+  age/source; nothing faked.
+
+Tests: **147 unit** (131 + 16 new TestDefenderScanPhase2) /
+**63 self-test** (56 + 7 new: threat names parse, threat status
+text is honest, threat default actions parse, defender scan
+commands, all four defender scans offered, threat history names +
+remove offered, new defender kinds are opt-in and ordered) /
+**42 packaging**. Ran green locally; CI reproduced on
+windows-latest (run 39380832939, SUCCESS).
+
+Release: GitHub release **v1.2.0** (published, not draft).
+WindowsHealthRepair-Setup.exe = **14,115,777 bytes**,
+SHA-256 `991a3353c96d6d09995e78a5daf672ef21fc72e14df88d552dd5093dba1fc818`,
+MD5 `bc51b274c0e6d7ad217e03193c7f701b` (downloaded and hash-verified
+against GitHub's recorded digest). Drive file
+`WindowsHealthRepair-Setup.exe` (ID 1dyC6B82FdFntVJVbQnFlXj3n9KoVtDe_)
+updated IN PLACE to the same bytes (post-upload size + MD5 verified).
+
+Honest limits: real-Windows behavior is UNVERIFIED until Shawn
+installs v1.2.0 on his PC — same status as every prior release of
+this app. The per-threat standing-action button copies one action
+to every listed threat's ID (labels say "listed threats"); a
+strictly per-threat picker is follow-up polish if wanted.

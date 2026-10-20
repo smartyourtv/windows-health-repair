@@ -3,8 +3,8 @@
 # (packaging/validate_packaging.py fails the build if they disagree).
 VSVersionInfo(
     ffi=FixedFileInfo(
-        filevers=(1, 1, 1, 0),
-        prodvers=(1, 1, 1, 0),
+        filevers=(1, 2, 0, 0),
+        prodvers=(1, 2, 0, 0),
         mask=0x3F,
         flags=0x0,
         OS=0x40004,
@@ -20,11 +20,11 @@ VSVersionInfo(
                     [
                         StringStruct("CompanyName", "smartyourtv"),
                         StringStruct("FileDescription", "Windows Health & Repair"),
-                        StringStruct("FileVersion", "1.1.1"),
+                        StringStruct("FileVersion", "1.2.0"),
                         StringStruct("InternalName", "WindowsHealthRepair"),
                         StringStruct("OriginalFilename", "WindowsHealthRepair.exe"),
                         StringStruct("ProductName", "Windows Health & Repair"),
-                        StringStruct("ProductVersion", "1.1.1"),
+                        StringStruct("ProductVersion", "1.2.0"),
                     ],
                 )
             ]

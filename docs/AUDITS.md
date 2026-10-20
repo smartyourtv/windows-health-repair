@@ -317,3 +317,106 @@ security, troubleshooter, or preventative logic):
 - *Tests:* 131 unit (96 baseline + 13 updater + 10 crash + 12
   self-repair), self-test 56 (40 baseline + 16 new), packaging
   42/42 at version 1.1.1.
+
+## Addendum 2026-10-19 — v1.2.0: Defender malware-scan feature
+## (Scout security capability, Phase 2)
+
+Spec: goals/kitt-van-voice-ai-build/hidden_files/
+scout-security-troubleshooting-design-2026-10-19.md, Phase 2.
+Owner order: laptop first (ClamAV, done — talk.py v1.3.14), then
+Windows. This release extends the EXISTING Defender plumbing
+(fix_defender_scan, parse_defender_status, parse_threat_
+detections, the defender_update fix kind) — no bundled engine,
+no duplicate machinery.
+
+### Change-impact audit (written BEFORE implementing)
+
+- *What changes:* windows_health.py only (plus tests, fixtures,
+  version strings, README/BUILD-STATUS docs). New pure parsers:
+  parse_threat_names (Get-MpThreat), parse_threat_default_
+  actions (Get-MpPreference ThreatIDDefaultAction_*), threat
+  status text mapping for ThreatStatusID, and pure command
+  builders for the scan types. fix_defender_scan generalizes
+  from QuickScan-only to payload scan_type quick|full|custom|
+  offline. Two new fix kinds — defender_threat_remove
+  (Remove-MpThreat) and defender_threat_action (Set-MpPreference
+  -ThreatIDDefaultAction_*: Defender's standing Quarantine/
+  Remove/Allow instruction for FUTURE detections of one threat)
+  — both in FIX_ORDER after defender_scan and both OPT_IN
+  (never default-checked). verify_step gains matching re-reads.
+- *Fix machinery:* every new action is a FixStep executed only
+  by execute_plan, whose step zero is the restore point; the
+  hard gate is untouched. No new execution path bypasses it:
+  the GUI's new buttons (folder scan; per-threat standing
+  actions) build a plan and call the same runner do_fix uses.
+- *Honesty boundaries:* Defender decides what quarantine and
+  removal mean; the app keeps NO quarantine store of its own
+  on Windows and reports Defender's own state back. The
+  standing-action buttons are labelled as FUTURE-detection
+  instructions — they do not act on the existing detection
+  (Remove-MpThreat does), and the UI text says exactly that.
+  The offline scan (Start-MpWDOSScan) RESTARTS the PC: the
+  finding's label and detail say so BEFORE the restore-point
+  gate, and its result text states the app cannot verify the
+  outcome until Windows is back (verify_step returns that
+  sentence, not a success claim).
+- *Regression risk:* _defender_findings gains an optional
+  third argument (names text) — existing 2-arg callers and
+  tests unaffected. parse_threat_detections gains one key
+  (action_success); existing keys unchanged. FIX_ORDER and
+  OPT_IN_KINDS are additive. The troubleshooter's threats
+  check stays a GUIDED outcome on purpose: detection history
+  persists after removal, so a "fixable" cause could never
+  verify — its guide text now points at the new Security
+  section actions instead. The spec's other Phase-2 lines
+  (signature update kind, gated Set-MpPreference fixes,
+  refusal-reported-not-worked-around) already exist in
+  v1.1.1 and are not re-built.
+- *Crash/self-repair coverage:* new fix code runs inside
+  run_fix_step's existing try; new findings build inside
+  scan_security's per-part isolation; GUI handlers follow the
+  existing payload-button pattern with error dialogs. The
+  four self-repairing JSON stores are untouched.
+- *Data/compat:* no stored-format changes; no new files on
+  the PC beyond the app's existing logs/reports.
+- *Tests:* new fixtures (Get-MpThreat names, preference
+  default actions, mixed-status detections) + a new unit
+  class; self-test gains parser/command-builder checks.
+  Baselines to preserve: 131 unit / 56 self-test / 42
+  packaging.
+
+### Pre-build audit (v1.2.0, after implementation, before build)
+
+- *Permissions:* no new permissions. All new Defender calls are
+  the same PowerShell surface the app already used (Defender
+  cmdlets + MpCmdRun fallback). Set-MpPreference changes ride
+  the existing admin + restore-point gates; Tamper Protection
+  refusals surface as failures with the Windows Security route
+  named — never bypassed or retried around.
+- *Null/error paths:* parsers return [] / {} on empty or
+  unparseable output (pinned by tests); command builders raise
+  ValueError BEFORE anything runs on a bad scan type or a
+  path-less custom scan; the custom scan also refuses a folder
+  that does not exist; threat-action steps refuse a non-integer
+  threat ID or a verb outside Defender's three.
+- *API use:* Start-MpWDOSScan is fire-and-forget by design —
+  the result text and verify_step both state the app cannot
+  verify an offline scan until Windows is back. No threading
+  changes: GUI actions run through confirm_and_run_plan's
+  worker thread, same as do_fix always did.
+- *Contracts:* Finding/FixStep shapes unchanged; the two new
+  payload buttons follow the existing payload-button pattern
+  in show_detail (launch/url/open_target precedents). The
+  troubleshooter threats check deliberately stays guided
+  (detection history persists after removal, so its cause
+  could never verify) and now points at the new actions.
+- *Security:* no new network surface (still only the updater's
+  GitHub calls); no secrets; custom paths are single-quote
+  escaped for PowerShell and validated to exist; threat IDs
+  are type-checked ints before entering a command string.
+- *Versions:* APP_VERSION, packaging/app-config.json and
+  packaging/version_info.txt all 1.2.0 — validate_packaging
+  re-checks this in CI. Baselines after the change: unit 147
+  (131 + 16 new), self-test 63/63 (56 + 7 new), packaging
+  42/42. CI must reproduce all three on windows-latest before
+  any release is published.

@@ -44,12 +44,13 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import urllib.error
 import urllib.request
 
 APP_NAME = "Windows Health & Repair"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 IS_WINDOWS = sys.platform.startswith("win")
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
@@ -190,6 +191,30 @@ def human_size(num):
             return "%.1f %s" % (num, unit)
         num /= 1024.0
     return "%.1f PB" % num
+
+
+def human_duration(seconds):
+    """Elapsed seconds -> plain text ('45s', '3 min 05s', '1h 02min')."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return "%ds" % seconds
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return "%d min %02ds" % (minutes, sec) if sec else "%d min" % minutes
+    hours, minutes = divmod(minutes, 60)
+    return "%dh %02dmin" % (hours, minutes)
+
+
+def scan_status_text(cat, i, total, elapsed=None):
+    """The scan status line (pure — used by the progress callback AND
+    the watchdog ticker, so both always agree on the wording)."""
+    text = "Scanning: %s (%d/%d)" % (CATEGORY_TITLES[cat], i + 1, total)
+    if elapsed is not None and elapsed >= 1:
+        text += " — %s so far" % human_duration(elapsed)
+    if elapsed is not None and elapsed >= 180:
+        text += (" — still running; this check has a time limit and "
+                 "will be reported if it overruns")
+    return text
 
 
 # ----------------------------------------------------------------------
@@ -2368,23 +2393,41 @@ SCANNERS = [
 # register themselves into SCANNERS at import time, in display order.
 
 
-def run_scan(log, progress=None, only=None):
-    """Run all scanners; one scanner failing never kills the scan."""
+def run_scan(log, progress=None, only=None, on_findings=None):
+    """Run all scanners; one scanner failing never kills the scan.
+
+    on_findings(batch), when given, is called with each scanner's
+    findings as soon as that scanner finishes, so a caller can show
+    results as they land instead of waiting for the slowest check
+    (v1.2.1 — the v1.1.1/v1.2.0 GUI rendered nothing until the very
+    end; see docs/AUDITS.md, 2026-10-20 addendum). Per-check start /
+    finish lines go to the log so a stall is pinpointed by the log's
+    last line.
+    """
     findings = []
     for i, (cat, fn) in enumerate(SCANNERS):
         if only and cat not in only:
             continue
         if progress:
             progress(cat, i, len(SCANNERS))
+        log("Check %d/%d: %s" % (i + 1, len(SCANNERS),
+                                 CATEGORY_TITLES.get(cat, cat)))
+        started = time.monotonic()
         try:
-            findings.extend(fn(log))
+            batch = fn(log)
         except Exception as exc:  # honest failure entry, never a crash
-            findings.append(Finding(
+            batch = [Finding(
                 cat, "This check failed to run: %s" % exc,
                 detail="The failure was recorded in the log. Other "
                        "checks are unaffected.",
-                severity="warn"))
+                severity="warn")]
             log("Scanner %s raised: %r" % (cat, exc))
+        findings.extend(batch)
+        log("Check %s finished in %.0fs — %d finding(s)." % (
+            CATEGORY_TITLES.get(cat, cat), time.monotonic() - started,
+            len(batch)))
+        if on_findings:
+            on_findings(batch)
     return findings
 
 
@@ -4002,27 +4045,41 @@ def launch_gui():
             return "    " + f.title
         return ("☑ " if checked else "☐ ") + f.title
 
+    def insert_findings(batch):
+        """Append findings to the tree under their category sections,
+        creating a section the first time one is needed. UI thread
+        only. Shared by populate() (whole-list) and the streaming
+        scan path (per-check batches)."""
+        parents = state.setdefault("cat_parents", {})
+        for f in batch:
+            parent = parents.get(f.category)
+            if parent is None:
+                parent = tree.insert("", "end",
+                                     text=CATEGORY_TITLES[f.category],
+                                     open=True)
+                parents[f.category] = parent
+            rid = tree.insert(parent, "end",
+                              text=finding_text(f, f in state["checked"]))
+            state["rows"][rid] = f
+
     def populate(findings):
         tree.delete(*tree.get_children())
-        state["findings"] = findings
+        state["findings"] = list(findings)
         state["rows"] = {}
-        by_cat = {}
-        for f in findings:
-            by_cat.setdefault(f.category, []).append(f)
-        for cat, _t in CATEGORIES:
-            items = by_cat.get(cat)
-            if not items:
-                continue
-            parent = tree.insert("", "end", text=CATEGORY_TITLES[cat],
-                                 open=True)
-            for f in items:
-                checked = f in state["checked"]
-                rid = tree.insert(parent, "end",
-                                  text=finding_text(f, checked))
-                state["rows"][rid] = f
+        state["cat_parents"] = {}
+        insert_findings(findings)
         status_var.set("Scan complete — %d finding(s). Tick the fixes "
                        "you want, then press 'Fix checked items'."
                        % len(findings))
+
+    def append_findings(batch):
+        """Streaming counterpart of populate(): a finished check's
+        findings appear immediately (v1.2.1)."""
+        state.setdefault("findings", []).extend(batch)
+        for f in batch:
+            if f.fix_kind and f.default_checked:
+                state["checked"].add(f)
+        insert_findings(batch)
 
     def show_detail(f):
         detail.configure(state="normal")
@@ -4181,23 +4238,82 @@ def launch_gui():
         state["cancel"].clear()
         state["checked"] = set()
         state["fix_results"] = None
+        state["findings"] = []
+        state["rows"] = {}
+        state["cat_parents"] = {}
+        tree.delete(*tree.get_children())
         log.start_file()
         log("Scan started (log: %s)" % log.path)
         set_busy(True, "Scanning… SFC/DISM checks can take several "
                        "minutes.")
+        token = object()
+        state["scan_token"] = token
+        state["scan_current"] = None  # (cat, i, total, monotonic start)
 
-        def progress(cat, i, total):
-            progress["maximum"] = total
-            progress["value"] = i + 1
-            status_var.set("Scanning: %s (%d/%d)"
-                           % (CATEGORY_TITLES[cat], i + 1, total))
+        def scan_progress(cat, i, total):
+            # Called from the worker thread. NEVER touch Tk here —
+            # marshal to the UI thread. (v1.1.1/v1.2.0 subscripted a
+            # same-named local function instead of the progressbar
+            # and died on the first call; see docs/AUDITS.md,
+            # 2026-10-20 addendum.)
+            def ui():
+                if state.get("scan_token") is not token:
+                    return
+                state["scan_current"] = (cat, i, total,
+                                          time.monotonic())
+                progress["maximum"] = total
+                progress["value"] = i + 1
+                status_var.set(scan_status_text(cat, i, total))
+            root.after(0, ui)
+
+        def stream(batch):
+            root.after(0, lambda b=batch: append_findings(b))
+
+        def watchdog():
+            # 1s ticker, UI thread: names the running check and how
+            # long it has been running, so a slow check never again
+            # looks like a frozen app.
+            if state.get("scan_token") is not token or not state["busy"]:
+                return
+            cur = state.get("scan_current")
+            if cur:
+                cat, i, total, started = cur
+                status_var.set(scan_status_text(
+                    cat, i, total, elapsed=time.monotonic() - started))
+            root.after(1000, watchdog)
+
+        root.after(1000, watchdog)
 
         def worker():
-            findings = run_scan(log, progress=progress)
-            for f in findings:
-                if f.fix_kind and f.default_checked:
-                    state["checked"].add(f)
-            root.after(0, lambda: (populate(findings), set_busy(False)))
+            try:
+                findings = run_scan(log, progress=scan_progress,
+                                    on_findings=stream)
+            except Exception:
+                etype, evalue, etb = sys.exc_info()
+                log("Scan failed unexpectedly: %r" % (evalue,))
+                write_crash_report(etype, evalue, etb, log=log)
+
+                def fail_ui():
+                    if state.get("scan_token") is not token:
+                        return
+                    set_busy(False)
+                    messagebox.showerror(
+                        "Scan failed",
+                        "The scan stopped unexpectedly. The failure "
+                        "was recorded in the log and the crash "
+                        "reports.\n\n%s" % evalue)
+                root.after(0, fail_ui)
+                return
+
+            def done_ui():
+                if state.get("scan_token") is not token:
+                    return
+                set_busy(False)
+                status_var.set(
+                    "Scan complete — %d finding(s). Tick the fixes "
+                    "you want, then press 'Fix checked items'."
+                    % len(findings))
+            root.after(0, done_ui)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -4222,14 +4338,31 @@ def launch_gui():
         state["cancel"].clear()
         set_busy(True, busy_text)
 
-        def progress(i, total, label):
-            progress["maximum"] = total
-            progress["value"] = i + 1
-            status_var.set("Fix %d/%d: %s" % (i + 1, total, label))
+        def fix_progress(i, total, label):
+            # Worker thread -> UI thread only (same v1.2.1 fix as
+            # scan_progress: no direct Tk calls, no shadowed names).
+            def ui():
+                progress["maximum"] = total
+                progress["value"] = i + 1
+                status_var.set("Fix %d/%d: %s" % (i + 1, total, label))
+            root.after(0, ui)
 
         def worker():
-            results = execute_plan(plan, log, progress=progress,
-                                   cancel=state["cancel"])
+            try:
+                results = execute_plan(plan, log, progress=fix_progress,
+                                       cancel=state["cancel"])
+            except Exception:
+                etype, evalue, etb = sys.exc_info()
+                log("Fix run failed unexpectedly: %r" % (evalue,))
+                write_crash_report(etype, evalue, etb, log=log)
+                root.after(0, lambda: (
+                    set_busy(False),
+                    messagebox.showerror(
+                        "Fix run failed",
+                        "The fix run stopped unexpectedly. The "
+                        "failure was recorded in the log and the "
+                        "crash reports.\n\n%s" % evalue)))
+                return
             state["fix_results"] = results
             ok_n = sum(1 for r in results if r[1])
             root.after(0, lambda: (

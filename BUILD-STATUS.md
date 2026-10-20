@@ -289,3 +289,32 @@ installs v1.2.0 on his PC — same status as every prior release of
 this app. The per-threat standing-action button copies one action
 to every listed threat's ID (labels say "listed threats"); a
 strictly per-threat picker is follow-up polish if wanted.
+
+## v1.2.1 — scan-hang fix (2026-10-20)
+
+Forensic fix for the owner's v1.1.1 incident (scan started
+2026-10-19 18:06, still "Scanning..." with an empty findings list
+at 21:44). Root cause, proven by code inspection + an off-Windows
+semantic reproduction: `do_scan`'s nested progress callback was
+named `progress`, shadowing the progressbar widget, and its body
+subscripted the function object — TypeError on the first callback,
+before any check ran, killing the worker thread silently. The same
+defect sat in the fix path's progress callback (a fix run would die
+identically, before the restore point — fail-safe but broken).
+Full write-up: docs/AUDITS.md, 2026-10-20 addendum.
+
+Fixes: both progress callbacks renamed + marshaled to the UI thread
+via root.after; run_scan streams findings per check (on_findings)
+and the GUI appends them immediately; per-check start/finish log
+lines with elapsed times; a 1s watchdog ticker names the running
+check + elapsed (scan_status_text); both workers wrapped so an
+unexpected failure is logged, crash-reported, dialogued, and always
+clears the busy state.
+
+Tests: **154 unit** (147 + 7 new TestScanHangRegression) /
+**63 self-test** / **42 packaging** — green locally; CI must
+reproduce on windows-latest before release.
+
+Honest limits: not proven on real Windows — the owner's install
+(v1.1.1 → v1.2.1 via the in-app updater or the Drive setup file)
+remains the test.

@@ -1763,5 +1763,102 @@ class TestSelfRepair(unittest.TestCase):
         self.assertIn("Recent self-repairs", src)
 
 
+# ----------------------------------------------------------------------
+# v1.2.1 — scan-hang regression (docs/AUDITS.md, 2026-10-20 addendum).
+# The v1.1.1/v1.2.0 GUI died on the scan's FIRST progress callback: a
+# nested def named `progress` shadowed the progressbar widget and its
+# body subscripted the function object (TypeError), killing the worker
+# thread before any check ran.
+# ----------------------------------------------------------------------
+
+class TestScanHangRegression(unittest.TestCase):
+    def setUp(self):
+        self._scanners = wh.SCANNERS
+        self.addCleanup(setattr, wh, "SCANNERS", self._scanners)
+        self.lines = []
+        self.log = lambda msg: self.lines.append(msg)
+
+    def _patch(self, scanners):
+        wh.SCANNERS = scanners
+
+    def test_run_scan_streams_each_check_as_it_finishes(self):
+        def one(log):
+            return [wh.Finding("safety", "a", severity="info"),
+                    wh.Finding("safety", "b", severity="info")]
+
+        def two(log):
+            return [wh.Finding("disk", "c", severity="info")]
+        self._patch([("safety", one), ("disk", two)])
+        batches, prog = [], []
+        out = wh.run_scan(self.log,
+                          progress=lambda c, i, t: prog.append((c, i, t)),
+                          on_findings=batches.append)
+        self.assertEqual([len(b) for b in batches], [2, 1])
+        self.assertEqual([f.title for b in batches for f in b],
+                         ["a", "b", "c"])
+        self.assertEqual([f.title for f in out], ["a", "b", "c"])
+        self.assertEqual(prog, [("safety", 0, 2), ("disk", 1, 2)])
+
+    def test_run_scan_streams_failure_finding_for_raising_check(self):
+        def boom(log):
+            raise RuntimeError("wedged")
+
+        def fine(log):
+            return [wh.Finding("disk", "ok", severity="info")]
+        self._patch([("safety", boom), ("disk", fine)])
+        batches = []
+        out = wh.run_scan(self.log, on_findings=batches.append)
+        self.assertEqual(len(batches), 2)
+        self.assertIn("failed to run", batches[0][0].title)
+        self.assertEqual(batches[1][0].title, "ok")
+        self.assertEqual(len(out), 2)
+
+    def test_progress_runs_before_each_scanner_even_on_failure(self):
+        def boom(log):
+            raise RuntimeError("wedged")
+        self._patch([("safety", boom), ("disk", lambda log: [])])
+        prog = []
+        wh.run_scan(self.log, progress=lambda c, i, t: prog.append(c))
+        self.assertEqual(prog, ["safety", "disk"])
+
+    def test_run_scan_logs_check_start_and_finish_lines(self):
+        self._patch([("safety", lambda log: [])])
+        wh.run_scan(self.log)
+        self.assertTrue(any(l.startswith("Check 1/1:") for l in self.lines))
+        self.assertTrue(any("finished in" in l and "finding(s)" in l
+                            for l in self.lines))
+
+    def test_scan_status_text_names_check_and_elapsed(self):
+        base = wh.scan_status_text("sysfiles", 1, 12)
+        self.assertEqual(base, "Scanning: System files (SFC / DISM) (2/12)")
+        slow = wh.scan_status_text("sysfiles", 1, 12, elapsed=65)
+        self.assertIn("1 min 05s so far", slow)
+        self.assertNotIn("still running", slow)
+        stuck = wh.scan_status_text("sysfiles", 1, 12, elapsed=600)
+        self.assertIn("still running", stuck)
+        self.assertIn("time limit", stuck)
+
+    def test_human_duration(self):
+        self.assertEqual(wh.human_duration(45), "45s")
+        self.assertEqual(wh.human_duration(60), "1 min")
+        self.assertEqual(wh.human_duration(65), "1 min 05s")
+        self.assertEqual(wh.human_duration(3600), "1h 00min")
+
+    def test_no_shadowed_progress_callback_remains(self):
+        src = open(os.path.join(os.path.dirname(__file__), "..",
+                                "windows_health.py"),
+                   encoding="utf-8").read()
+        # The download progress(done, total) is the only def progress
+        # left, and it never subscripts itself.
+        self.assertEqual(src.count("def progress("), 1)
+        self.assertNotIn("def progress(cat", src)
+        self.assertNotIn("def progress(i, total, label)", src)
+        # The scan/fix callbacks are renamed and marshaled.
+        self.assertIn("def scan_progress(cat, i, total)", src)
+        self.assertIn("def fix_progress(i, total, label)", src)
+        self.assertIn("on_findings=stream", src)
+        self.assertIn('state["scan_token"]', src)
+
+
 if __name__ == "__main__":
     unittest.main()

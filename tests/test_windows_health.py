@@ -628,6 +628,245 @@ class TestSecurityRestructure(unittest.TestCase):
         self.assertEqual(off[0].payload["profile"], "Public")
 
 
+# ----------------------------------------------------------------------
+# v1.2.0 — Defender malware scans (quick/full/custom/offline),
+# named threat history, Defender's own threat actions
+# ----------------------------------------------------------------------
+
+class TestDefenderScanPhase2(unittest.TestCase):
+    def _with_fakes(self, fn, run_ps=None, run_cmd=None, ps_json=None,
+                    detections=None):
+        orig = (wh.run_ps, wh.run_cmd, wh.ps_json,
+                wh._defender_detections_now)
+        try:
+            if run_ps is not None:
+                wh.run_ps = run_ps
+            if run_cmd is not None:
+                wh.run_cmd = run_cmd
+            if ps_json is not None:
+                wh.ps_json = ps_json
+            if detections is not None:
+                wh._defender_detections_now = \
+                    lambda log: (True, detections)
+            return fn()
+        finally:
+            (wh.run_ps, wh.run_cmd, wh.ps_json,
+             wh._defender_detections_now) = orig
+
+    def test_threat_names_parse_and_join(self):
+        names = wh.parse_threat_names(fx.THREAT_NAMES_JSON)
+        self.assertEqual(len(names), 2)
+        by_id = wh.threat_names_by_id(names)
+        self.assertEqual(by_id[2147735505],
+                         "Trojan:Win32/Wacatac.B!ml")
+        self.assertEqual(wh.parse_threat_names(""), [])
+
+    def test_threat_status_text_known_and_unknown(self):
+        self.assertTrue(wh.threat_status_text(1)
+                        .startswith("detected"))
+        self.assertTrue(wh.threat_status_text(4)
+                        .startswith("removed"))
+        unknown = wh.threat_status_text(999)
+        self.assertIn("999", unknown)
+        self.assertIn("unknown", wh.threat_status_text(None))
+
+    def test_threat_default_actions_parse(self):
+        out = wh.parse_threat_default_actions(
+            fx.DEFENDER_PREFERENCE_ACTIONS_JSON)
+        self.assertEqual(out, {2147735505: 2})
+        self.assertEqual(wh.parse_threat_default_actions(""), {})
+        single = wh.parse_threat_default_actions(
+            '{"ThreatIDDefaultAction_Ids":5,'
+            '"ThreatIDDefaultAction_Actions":3}')
+        self.assertEqual(single, {5: 3})
+
+    def test_detections_gain_action_success_key(self):
+        d = wh.parse_threat_detections(fx.THREATS_ACTIVE_JSON)[0]
+        self.assertIs(d["action_success"], False)
+        self.assertEqual(d["status_id"], 1)
+
+    def test_scan_command_builders(self):
+        self.assertEqual(wh.defender_scan_ps("quick"),
+                         "Start-MpScan -ScanType QuickScan")
+        self.assertEqual(wh.defender_scan_ps("full"),
+                         "Start-MpScan -ScanType FullScan")
+        self.assertEqual(
+            wh.defender_scan_ps("custom", r"C:\My Downloads"),
+            "Start-MpScan -ScanType CustomScan "
+            "-ScanPath 'C:\\My Downloads'")
+        self.assertIsNone(wh.defender_scan_ps("offline"))
+        self.assertEqual(wh.defender_scan_mpcmdrun_suffix("quick"),
+                         "-Scan -ScanType 1")
+        self.assertEqual(
+            wh.defender_scan_mpcmdrun_suffix("custom", "D:\\stick"),
+            "-Scan -ScanType 3 -File 'D:\\stick'")
+        self.assertIsNone(wh.defender_scan_mpcmdrun_suffix("offline"))
+        with self.assertRaises(ValueError):
+            wh.defender_scan_ps("custom")
+        with self.assertRaises(ValueError):
+            wh.defender_scan_ps("sideways")
+
+    def test_findings_offer_full_scan_set(self):
+        out = wh._defender_findings(fx.DEFENDER_STATUS_JSON,
+                                    fx.THREATS_ACTIVE_JSON,
+                                    fx.THREAT_NAMES_JSON)
+        scans = {f.payload.get("scan_type"): f for f in out
+                 if f.fix_kind == "defender_scan"}
+        self.assertEqual(set(scans), {"quick", "full", "offline"})
+        self.assertTrue(all(not f.default_checked
+                            for f in scans.values()))
+        offline = scans["offline"]
+        self.assertIn("RESTARTS", offline.title)
+        self.assertIn("CANNOT see or verify", offline.detail)
+        folder = [f for f in out
+                  if (f.payload or {}).get("defender_folder_scan")]
+        self.assertEqual(len(folder), 1)
+
+    def test_threat_history_named_with_actions(self):
+        out = wh._defender_findings(fx.DEFENDER_STATUS_JSON,
+                                    fx.THREATS_MIXED_JSON,
+                                    fx.THREAT_NAMES_JSON)
+        hist = [f for f in out
+                if f.title.startswith("Threat detected:")]
+        self.assertEqual(len(hist), 2)
+        active = [f for f in hist
+                  if "Wacatac" in f.title][0]
+        self.assertEqual(active.severity, "bad")
+        self.assertIn("still needs action", active.detail)
+        self.assertEqual(
+            active.payload["threat_actions"]["threat_id"],
+            2147735505)
+        removed = [f for f in hist if "Packunwan" in f.title][0]
+        self.assertEqual(removed.severity, "warn")
+        self.assertIn("removed by Defender", removed.detail)
+        kinds = [f.fix_kind for f in out if f.fix_kind]
+        self.assertIn("defender_threat_remove", kinds)
+
+    def test_threat_history_no_remove_when_none_active(self):
+        out = wh._defender_findings(fx.DEFENDER_STATUS_JSON,
+                                    fx.THREATS_JSON,  # status 3
+                                    fx.THREAT_NAMES_JSON)
+        kinds = [f.fix_kind for f in out if f.fix_kind]
+        self.assertNotIn("defender_threat_remove", kinds)
+
+    def test_threat_action_validation_refuses_garbage(self):
+        log = wh.RunLog()
+        bad_id = wh.FixStep("defender_threat_action", "x",
+                            payload={"threat_id": "abc",
+                                     "action": "Remove"})
+        ok, msg = wh.fix_defender_threat_action(bad_id, log)
+        self.assertFalse(ok)
+        self.assertIn("refusing", msg)
+        bad_verb = wh.FixStep("defender_threat_action", "x",
+                              payload={"threat_id": 5,
+                                       "action": "Nuke"})
+        ok, msg = wh.fix_defender_threat_action(bad_verb, log)
+        self.assertFalse(ok)
+        self.assertIn("refusing", msg)
+
+    def test_threat_action_command_and_refusal(self):
+        seen = []
+
+        def fake_ps(cmd, timeout=0, log=None):
+            seen.append(cmd)
+            return 0, ""
+
+        step = wh.FixStep("defender_threat_action", "x",
+                          payload={"threat_id": 2147735505,
+                                   "threat_name": "Trojan:X",
+                                   "action": "Quarantine"})
+        ok, msg = self._with_fakes(
+            lambda: wh.fix_defender_threat_action(step, wh.RunLog()),
+            run_ps=fake_ps)
+        self.assertTrue(ok)
+        self.assertIn("ThreatIDDefaultAction_Ids 2147735505",
+                      seen[0])
+        self.assertIn("NEXT time", msg)
+
+        def refusing_ps(cmd, timeout=0, log=None):
+            return 1, "Access denied by tamper protection"
+
+        ok, msg = self._with_fakes(
+            lambda: wh.fix_defender_threat_action(step, wh.RunLog()),
+            run_ps=refusing_ps)
+        self.assertFalse(ok)
+        self.assertIn("refused", msg)
+        self.assertIn("does not", msg)  # no workaround offered
+
+    def test_threat_remove_recounts_active(self):
+        step = wh.FixStep("defender_threat_remove", "x")
+        gone = wh.parse_threat_detections(fx.THREATS_JSON)  # st. 3
+        ok, msg = self._with_fakes(
+            lambda: wh.fix_defender_threat_remove(step, wh.RunLog()),
+            run_ps=lambda cmd, timeout=0, log=None: (0, ""),
+            detections=gone)
+        self.assertTrue(ok)
+        self.assertIn("no detections remain", msg)
+        still = wh.parse_threat_detections(fx.THREATS_ACTIVE_JSON)
+        ok, msg = self._with_fakes(
+            lambda: wh.fix_defender_threat_remove(step, wh.RunLog()),
+            run_ps=lambda cmd, timeout=0, log=None: (0, ""),
+            detections=still)
+        self.assertTrue(ok)
+        self.assertIn("still marked", msg)
+
+    def test_offline_scan_scheduling_and_honesty(self):
+        step = wh.FixStep("defender_scan", "x",
+                          payload={"scan_type": "offline"})
+        ok, msg = self._with_fakes(
+            lambda: wh.fix_defender_scan(step, wh.RunLog()),
+            run_ps=lambda cmd, timeout=0, log=None: (0, ""))
+        self.assertTrue(ok)
+        self.assertIn("RESTART", msg)
+        self.assertIn("CANNOT verify", msg)
+        ok, msg = self._with_fakes(
+            lambda: wh.fix_defender_scan(step, wh.RunLog()),
+            run_ps=lambda cmd, timeout=0, log=None: (1, "nope"))
+        self.assertFalse(ok)
+
+    def test_custom_scan_missing_folder_refused(self):
+        step = wh.FixStep(
+            "defender_scan", "x",
+            payload={"scan_type": "custom",
+                     "scan_path": "/definitely/not/a/real/folder"})
+        ok, msg = wh.fix_defender_scan(step, wh.RunLog())
+        self.assertFalse(ok)
+        self.assertIn("folder not found", msg)
+
+    def test_verify_threat_action_reads_back(self):
+        step = wh.FixStep("defender_threat_action", "x",
+                          payload={"threat_id": 2147735505,
+                                   "action": "Remove"})
+        note = self._with_fakes(
+            lambda: wh.verify_step(step, wh.RunLog()),
+            ps_json=lambda cmd, timeout=0, log=None:
+                (True, fx.DEFENDER_PREFERENCE_ACTIONS_JSON))
+        if wh.IS_WINDOWS:
+            self.assertIn("standing action for threat", note)
+        else:
+            self.assertIsNone(note)  # verify degrades off-Windows
+
+    def test_new_kinds_opt_in_and_ordered(self):
+        self.assertIn("defender_threat_remove", wh.OPT_IN_KINDS)
+        self.assertIn("defender_threat_action", wh.OPT_IN_KINDS)
+        self.assertLess(wh.FIX_ORDER["defender_scan"],
+                        wh.FIX_ORDER["defender_threat_remove"])
+        self.assertLess(wh.FIX_ORDER["defender_threat_remove"],
+                        wh.FIX_ORDER["defender_threat_action"])
+
+    def test_gui_contract_defender_actions(self):
+        src = open(os.path.join(os.path.dirname(__file__), "..",
+                                "windows_health.py"),
+                   encoding="utf-8").read()
+        self.assertIn("def confirm_and_run_plan", src)
+        self.assertIn('get("defender_folder_scan")', src)
+        self.assertIn('get("threat_actions")', src)
+        self.assertIn("askdirectory", src)
+        # do_fix runs through the same single plan path
+        self.assertIn("confirm_and_run_plan(\n            "
+                      "build_fix_plan(chosen)", src)
+
+
 class TestNewParsers(unittest.TestCase):
     def test_nslookup(self):
         self.assertTrue(wh.parse_nslookup(fx.NSLOOKUP_OK)["ok"])

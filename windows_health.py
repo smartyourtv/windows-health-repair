@@ -49,7 +49,7 @@ import urllib.error
 import urllib.request
 
 APP_NAME = "Windows Health & Repair"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 
 IS_WINDOWS = sys.platform.startswith("win")
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
@@ -577,12 +577,15 @@ FIX_ORDER = {
     "wsreset": 80,
     "net_reset": 90,
     "defender_scan": 95,
+    "defender_threat_remove": 96,
+    "defender_threat_action": 97,
     "memdiag": 100,
 }
 
 # Fix kinds that are risky enough to be OFF unless the user ticks them on
 # purpose in the GUI (they are never default-checked).
-OPT_IN_KINDS = {"net_reset", "wsreset", "defender_scan"}
+OPT_IN_KINDS = {"net_reset", "wsreset", "defender_scan",
+                "defender_threat_remove", "defender_threat_action"}
 
 
 class FixStep:
@@ -732,8 +735,79 @@ def parse_threat_detections(text):
             "threat_id": d.get("ThreatID"),
             "detected": _parse_ms_date(d.get("InitialDetectionTime")),
             "status_id": d.get("ThreatStatusID"),
+            "action_success": d.get("ActionSuccess"),
             "resources": d.get("Resources") or [],
         })
+    return out
+
+
+# ThreatStatusID values as documented for Get-MpThreatDetection.
+# Anything outside this table is reported as an unknown code, never
+# guessed at — the number itself is always shown alongside.
+THREAT_STATUS_TEXT = {
+    0: "state unknown",
+    1: "detected — still needs action",
+    2: "cleaned",
+    3: "quarantined by Defender",
+    4: "removed by Defender",
+    5: "allowed (by you or by policy)",
+    6: "blocked",
+}
+
+# Status IDs that mean a detection is still sitting there unhandled.
+THREAT_ACTIVE_STATUS_IDS = {1}
+
+
+def threat_status_text(status_id):
+    """ThreatStatusID -> plain text (the raw code is kept by callers)."""
+    try:
+        sid = int(status_id)
+    except (TypeError, ValueError):
+        return "state unknown"
+    return THREAT_STATUS_TEXT.get(sid, "state unknown (code %s)" % sid)
+
+
+def parse_threat_names(text):
+    """Parse Get-MpThreat JSON -> [{threat_id, name, severity_id,
+    category_id}]. Get-MpThreat is Defender's catalog of the threats
+    it has met on this PC — this is where detection names come from."""
+    out = []
+    for d in parse_json_list(text):
+        out.append({
+            "threat_id": d.get("ThreatID"),
+            "name": str(d.get("ThreatName") or ""),
+            "severity_id": d.get("SeverityID"),
+            "category_id": d.get("CategoryID"),
+        })
+    return out
+
+
+def threat_names_by_id(names):
+    """parse_threat_names output -> {threat_id: name} (named only)."""
+    return {n["threat_id"]: n["name"] for n in names if n.get("name")}
+
+
+def parse_threat_default_actions(text):
+    """Parse Get-MpPreference JSON -> {threat_id: action_code}.
+
+    ThreatIDDefaultAction_Ids and ThreatIDDefaultAction_Actions are
+    parallel arrays in the preference object. The action codes are
+    Defender's own numbering; they are carried raw and reported as
+    codes, never decoded into verbs this app cannot verify.
+    """
+    rows = parse_json_list(text)
+    if not rows:
+        return {}
+    d = rows[0]
+    ids = d.get("ThreatIDDefaultAction_Ids") or []
+    actions = d.get("ThreatIDDefaultAction_Actions") or []
+    if isinstance(ids, (int, str)):
+        ids = [ids]
+    if isinstance(actions, (int, str)):
+        actions = [actions]
+    out = {}
+    for i, tid in enumerate(ids):
+        out[tid] = actions[i] if i < len(actions) else None
     return out
 
 
@@ -1397,7 +1471,81 @@ DEFENDER_STATUS_PS = (
     "QuickScanNeeded, FullScanNeeded | ConvertTo-Json -Compress")
 
 
-def _defender_findings(status_txt, threat_txt):
+def _threat_history_findings(threats, names):
+    """The threat history block (v1.2.0): every detection Defender
+    has on record, NAMED where Get-MpThreat knows the name, with
+    Defender's own actions attached.
+
+    Two different action kinds, kept unmistakably separate in the
+    wording: Remove-MpThreat acts on the CURRENT active threats;
+    the per-threat standing actions (payload buttons in the GUI)
+    only set what Defender does on FUTURE detections.
+    """
+    out = []
+    if not threats:
+        return out
+    ordered = sorted(
+        threats,
+        key=lambda d: d["detected"] or datetime.datetime.min,
+        reverse=True)
+    shown = ordered[:8]
+    for d in shown:
+        tid = d["threat_id"]
+        name = names.get(tid) or ""
+        title = ("Threat detected: %s" % name) if name else \
+            "Threat detected (Defender threat ID %s)" % tid
+        lines = []
+        if d["detected"]:
+            lines.append("First detected: %s"
+                         % d["detected"].strftime("%Y-%m-%d %H:%M"))
+        lines.append("Defender's state for it: %s (status code %s)"
+                     % (threat_status_text(d["status_id"]),
+                        d["status_id"]))
+        for res in (d["resources"] or [])[:3]:
+            lines.append("Seen in: %s" % res)
+        if len(d["resources"] or []) > 3:
+            lines.append("… and %d more place(s)"
+                         % (len(d["resources"]) - 3))
+        lines.append("This history is Defender's own record (from "
+                     "Get-MpThreatDetection) — this app reports it, "
+                     "it does not keep a second copy.")
+        payload = {}
+        if isinstance(tid, int) and not isinstance(tid, bool):
+            payload = {"threat_actions": {"threat_id": tid,
+                                          "threat_name": name}}
+        out.append(Finding(
+            "security", title, detail="\n".join(lines),
+            payload=payload,
+            severity="bad" if d["status_id"]
+            in THREAT_ACTIVE_STATUS_IDS else "warn"))
+    if len(ordered) > len(shown):
+        out.append(Finding(
+            "security", "… and %d more threat detection(s) on record"
+            % (len(ordered) - len(shown)),
+            detail="The full list lives in Windows Security → "
+                   "Protection history.",
+            severity="warn"))
+    active = [d for d in threats
+              if d["status_id"] in THREAT_ACTIVE_STATUS_IDS]
+    if active:
+        out.append(Finding(
+            "security", "Remove the threat(s) still needing action",
+            detail="Runs Defender's own Remove-MpThreat: Defender "
+                   "removes or quarantines each active threat by "
+                   "its own policy. This app never deletes the "
+                   "files itself and keeps no quarantine of its "
+                   "own on Windows.",
+            why="%d detection(s) are still marked as needing "
+                "action. Left alone, detected malware can keep "
+                "running." % len(active),
+            fix_label="Remove active threats with Defender "
+                      "(Remove-MpThreat)",
+            fix_kind="defender_threat_remove",
+            default_checked=False, severity="bad"))
+    return out
+
+
+def _defender_findings(status_txt, threat_txt, names_txt=None):
     """Findings from raw Defender outputs (pure given the texts).
 
     v1.1.0 restructure (docs/AUDITS.md): the security scan used to be
@@ -1406,11 +1554,19 @@ def _defender_findings(status_txt, threat_txt):
     healthy PC almost no Defender action was offered at all. Now the
     Defender part leads with a summary, always offers its actions,
     and fails alone if it fails.
+
+    v1.2.0: the scan offer became the full set (quick / full /
+    custom folder / offline), and detections became a named threat
+    history with Defender's own actions attached. names_txt is the
+    raw Get-MpThreat output (optional; history falls back to threat
+    IDs when it is absent).
     """
     out = []
     st = parse_defender_status(extract_json_text(status_txt or "")
                                or (status_txt or ""))
     threats = parse_threat_detections(threat_txt) if threat_txt else []
+    names = threat_names_by_id(
+        parse_threat_names(names_txt)) if names_txt else {}
     out.append(Finding(
         "security", defender_summary_line(
             st, len(threats) if threat_txt else None),
@@ -1505,8 +1661,47 @@ def _defender_findings(status_txt, threat_txt):
             "It is OFF by default here because it takes a few "
             "minutes; tick it if you want it in this run.",
         fix_label="Run Defender Quick Scan (results reported after)",
-        fix_kind="defender_scan", default_checked=False,
+        fix_kind="defender_scan", payload={"scan_type": "quick"},
+        default_checked=False,
         severity="info"))
+    out.append(Finding(
+        "security", "Run a Defender Full Scan",
+        detail="Checks every file on the PC, not just the usual "
+               "hiding places. Can take an hour or more on a big "
+               "drive; the PC stays usable while it runs.",
+        why="Worth it after any detection, or if the PC has never "
+            "had one. Defender does the scanning and makes all "
+            "quarantine decisions.",
+        fix_label="Run Defender Full Scan (results reported after)",
+        fix_kind="defender_scan", payload={"scan_type": "full"},
+        default_checked=False,
+        severity="info"))
+    out.append(Finding(
+        "security", "Run a Defender Offline Scan — RESTARTS this PC",
+        detail="Schedules Microsoft Defender Offline and RESTARTS "
+               "the PC: the scan runs before Windows loads, which "
+               "is how stubborn malware that hides from a running "
+               "Windows gets caught. Save your work first. This app "
+               "CANNOT see or verify the result — after Windows "
+               "starts again, check Windows Security → Protection "
+               "history (or re-scan here and read the threat "
+               "history).",
+        why="The tool Microsoft provides for infections that "
+            "survive ordinary scans.",
+        fix_label="Run Defender Offline Scan (PC restarts; result "
+                  "checked in Windows Security afterwards)",
+        fix_kind="defender_scan", payload={"scan_type": "offline"},
+        default_checked=False,
+        severity="info"))
+    out.append(Finding(
+        "security", "Scan one folder with Defender",
+        detail="Pick any folder (a downloads folder, a USB stick) "
+               "and Defender scans just that, behind the same "
+               "restore-point gate as every fix here.",
+        payload={"defender_folder_scan": True,
+                 "folder_scan_label": "Choose a folder to scan…"},
+        severity="info"))
+    out.extend(_threat_history_findings(threats, names))
     out.append(Finding(
         "security", "Open Windows Security",
         detail="Opens Microsoft's own security app — protection "
@@ -1633,8 +1828,13 @@ def scan_security(log):
             "Get-MpThreatDetection | Select-Object ThreatID, "
             "InitialDetectionTime, ThreatStatusID, Resources | "
             "ConvertTo-Json -Compress", timeout=120, log=log)
+        _ok3, ntxt = ps_json(
+            "Get-MpThreat | Select-Object ThreatID, ThreatName, "
+            "SeverityID, CategoryID | ConvertTo-Json -Compress",
+            timeout=120, log=log)
         return _defender_findings(txt if ok else "",
-                                  ttxt if ok2 else None)
+                                  ttxt if ok2 else None,
+                                  ntxt if _ok3 else None)
 
     _part("Defender status", _defender)
     # The Malwarebytes card sits directly under the Defender summary.
@@ -2439,35 +2639,192 @@ def fix_driver_install(step, log):
     return True, msg
 
 
-def fix_defender_scan(step, log):
-    """Start-MpScan QuickScan; detections are Defender's decisions."""
-    started = datetime.datetime.now()
-    rc, out = run_ps("Start-MpScan -ScanType QuickScan",
-                     timeout=3600, log=log)
-    if rc != 0:
-        rc, out = run_cmd(["powershell", "-NoProfile", "-Command",
-                           MPCMDRUN_PS + "& $exe -Scan -ScanType 1"],
-                          timeout=3600, log=log)
+DEFENDER_SCAN_TYPES = ("quick", "full", "custom", "offline")
+
+# MpCmdRun -ScanType numbering (Defender's own): 1 quick, 2 full,
+# 3 custom (needs -File). Offline scan has no -ScanType; it is
+# Start-MpWDOSScan and is handled separately.
+_MPCMDRUN_SCAN_TYPES = {"quick": 1, "full": 2, "custom": 3}
+
+
+def _ps_quote(value):
+    """Quote a string for a single-quoted PowerShell literal."""
+    return "'%s'" % str(value).replace("'", "''")
+
+
+def defender_scan_ps(scan_type, scan_path=""):
+    """Start-MpScan command for a scan type -> PS string, or None
+    for the offline scan (which is not Start-MpScan at all).
+
+    Pure — unit-tested. Raises ValueError on a bad type or a
+    custom scan without a path, so a malformed step fails BEFORE
+    anything runs, not inside Defender.
+    """
+    stype = (scan_type or "quick").lower()
+    if stype == "quick":
+        return "Start-MpScan -ScanType QuickScan"
+    if stype == "full":
+        return "Start-MpScan -ScanType FullScan"
+    if stype == "custom":
+        if not scan_path:
+            raise ValueError("custom scan needs a folder path")
+        return ("Start-MpScan -ScanType CustomScan -ScanPath %s"
+                % _ps_quote(scan_path))
+    if stype == "offline":
+        return None
+    raise ValueError("unknown Defender scan type: %s" % scan_type)
+
+
+def defender_scan_mpcmdrun_suffix(scan_type, scan_path=""):
+    """MpCmdRun fallback suffix (appended after MPCMDRUN_PS's
+    `& $exe`) for a scan type -> string, or None for offline."""
+    stype = (scan_type or "quick").lower()
+    if stype == "offline":
+        return None
+    if stype not in _MPCMDRUN_SCAN_TYPES:
+        raise ValueError("unknown Defender scan type: %s" % scan_type)
+    suffix = "-Scan -ScanType %d" % _MPCMDRUN_SCAN_TYPES[stype]
+    if stype == "custom":
+        if not scan_path:
+            raise ValueError("custom scan needs a folder path")
+        suffix += " -File %s" % _ps_quote(scan_path)
+    return suffix
+
+
+def _defender_detections_now(log):
+    """Re-read Defender's detection history -> (ok, [detections])."""
     ok, txt = ps_json(
         "Get-MpThreatDetection | Select-Object ThreatID, "
         "InitialDetectionTime, ThreatStatusID, Resources | "
         "ConvertTo-Json -Compress", timeout=120, log=log)
-    detections = parse_threat_detections(txt) if ok else []
+    return ok, (parse_threat_detections(txt) if ok else [])
+
+
+def fix_defender_scan(step, log):
+    """Run a Defender scan; detections are Defender's decisions.
+
+    Payload scan_type: quick (the v1.0.0 behaviour) | full |
+    custom (payload scan_path) | offline. Offline is
+    Start-MpWDOSScan: it RESTARTS the PC into Defender Offline,
+    so there is nothing to read back afterwards — the result
+    text says exactly that instead of claiming a verification
+    this app cannot have.
+    """
+    scan_type = (step.payload.get("scan_type") or "quick").lower()
+    scan_path = step.payload.get("scan_path") or ""
+    label = {"quick": "quick scan", "full": "full scan",
+             "custom": "folder scan",
+             "offline": "offline scan"}.get(scan_type, "scan")
+    if scan_type == "offline":
+        rc, out = run_ps("Start-MpWDOSScan", timeout=300, log=log)
+        if rc != 0:
+            return False, ("Defender offline scan could not be "
+                           "scheduled: %s" % out.strip()[:300])
+        return True, (
+            "offline scan scheduled — this PC will RESTART into "
+            "Microsoft Defender Offline, which scans before Windows "
+            "loads (that is what catches stubborn malware). This app "
+            "CANNOT verify the result: after Windows starts again, "
+            "check Windows Security → Protection history, or re-run "
+            "this app's scan and read the threat history there.")
+    try:
+        ps_cmd = defender_scan_ps(scan_type, scan_path)
+        suffix = defender_scan_mpcmdrun_suffix(scan_type, scan_path)
+    except ValueError as exc:
+        return False, "refusing to scan: %s" % exc
+    if scan_type == "custom" and not os.path.isdir(scan_path):
+        return False, ("refusing to scan: folder not found: %s"
+                       % scan_path)
+    started = datetime.datetime.now()
+    rc, out = run_ps(ps_cmd, timeout=3600, log=log)
+    if rc != 0 and suffix:
+        rc, out = run_cmd(["powershell", "-NoProfile", "-Command",
+                           MPCMDRUN_PS + "& $exe " + suffix],
+                          timeout=3600, log=log)
+    ok, detections = _defender_detections_now(log)
     fresh = [d for d in detections
              if d["detected"] and d["detected"] >= started]
     if rc != 0:
-        return False, ("Defender quick scan did not complete: %s"
-                       % out.strip()[:300])
+        if "already" in out.lower() and "scan" in out.lower():
+            return False, ("Defender says a scan is already "
+                           "running — let that one finish rather "
+                           "than stacking another. (%s)"
+                           % out.strip()[:200])
+        return False, ("Defender %s did not complete: %s"
+                       % (label, out.strip()[:300]))
     if fresh:
         ids = ", ".join(str(d["threat_id"]) for d in fresh)
-        return True, ("quick scan finished — Defender recorded %d NEW "
-                      "detection(s) (threat IDs: %s). Defender handles "
-                      "quarantine itself; review and decide in Windows "
-                      "Security → Protection history."
-                      % (len(fresh), ids))
-    return True, ("quick scan finished — no new detections. (Total "
+        return True, ("%s finished — Defender recorded %d NEW "
+                      "detection(s) (threat IDs: %s). Defender "
+                      "handles quarantine itself; review and decide "
+                      "in Windows Security → Protection history, or "
+                      "in this app's Security section after a re-scan."
+                      % (label, len(fresh), ids))
+    return True, ("%s finished — no new detections. (Total "
                   "historical detections on record: %d)"
-                  % len(detections))
+                  % (label, len(detections)))
+
+
+def fix_defender_threat_remove(step, log):
+    """Remove-MpThreat: Defender removes or quarantines every
+    ACTIVE threat, by Defender's own policy. This app keeps no
+    quarantine store of its own on Windows — the re-read state
+    afterwards is Defender's, reported as Defender's."""
+    rc, out = run_ps("Remove-MpThreat", timeout=1800, log=log)
+    ok, detections = _defender_detections_now(log)
+    active = [d for d in detections
+              if d["status_id"] in THREAT_ACTIVE_STATUS_IDS]
+    if rc != 0:
+        return False, ("Remove-MpThreat did not complete: %s"
+                       % out.strip()[:300])
+    if active:
+        ids = ", ".join(str(d["threat_id"]) for d in active)
+        return True, ("Defender's removal ran, but %d detection(s) "
+                      "are still marked as needing action (threat "
+                      "IDs: %s). Try the offline scan from the "
+                      "Security section, and review in Windows "
+                      "Security → Protection history."
+                      % (len(active), ids))
+    return True, ("Defender's removal ran — no detections remain "
+                  "marked as needing action. (Detection history "
+                  "stays on record: %d entr(ies).)" % len(detections))
+
+
+# The standing actions Defender itself accepts for a threat ID
+# (Set-MpPreference -ThreatIDDefaultAction_Actions). These set
+# what Defender does on FUTURE detections; they do not touch the
+# detection already on record.
+DEFENDER_THREAT_ACTIONS = ("Quarantine", "Remove", "Allow")
+
+
+def fix_defender_threat_action(step, log):
+    """Set Defender's standing action for ONE threat ID."""
+    tid = step.payload.get("threat_id")
+    action = step.payload.get("action") or ""
+    name = step.payload.get("threat_name") or ""
+    if not isinstance(tid, int) or isinstance(tid, bool):
+        return False, "refusing: threat ID looks wrong (%r)" % (tid,)
+    if action not in DEFENDER_THREAT_ACTIONS:
+        return False, ("refusing: unknown Defender action %r (only "
+                       "%s exist)" % (action,
+                                      ", ".join(DEFENDER_THREAT_ACTIONS)))
+    rc, out = run_ps(
+        "Set-MpPreference -ThreatIDDefaultAction_Ids %d "
+        "-ThreatIDDefaultAction_Actions %s" % (tid, action),
+        timeout=120, log=log)
+    if rc != 0:
+        return False, ("Defender refused the standing action (%s). "
+                       "Tamper Protection can block preference "
+                       "changes from outside Windows Security — if "
+                       "so, set it there instead; this app does not "
+                       "work around that refusal."
+                       % out.strip()[:200])
+    shown = ("%s (threat %d)" % (name, tid)) if name \
+        else "threat %d" % tid
+    return True, ("Defender's standing action for %s is now: %s. "
+                  "This applies the NEXT time Defender meets this "
+                  "threat — it does not change the detection already "
+                  "on record." % (shown, action))
 
 
 def wu_cache_backup_name(when=None):
@@ -2708,6 +3065,10 @@ def run_fix_step(step, log):
                 if rc == 0 else "removal failed: %s" % out.strip()[:200]
         if kind == "defender_scan":
             return fix_defender_scan(step, log)
+        if kind == "defender_threat_remove":
+            return fix_defender_threat_remove(step, log)
+        if kind == "defender_threat_action":
+            return fix_defender_threat_action(step, log)
         if kind == "driver_install":
             return fix_driver_install(step, log)
         if kind == "net_reset":
@@ -2838,6 +3199,54 @@ def verify_step(step, log):
                     rows[0].get("AntivirusSignatureVersion") or "?",
                     rows[0].get("AntivirusSignatureAge"))
             return "verify: could not re-read the signature state"
+        if step.kind == "defender_scan":
+            scan_type = (step.payload.get("scan_type")
+                         or "quick").lower()
+            if scan_type == "offline":
+                return ("verify: impossible until this PC has "
+                        "restarted into Defender Offline and back — "
+                        "check Windows Security → Protection history")
+            if scan_type == "custom":
+                ok, detections = _defender_detections_now(log)
+                if ok:
+                    return ("verify: %d detection(s) on record with "
+                            "Defender now" % len(detections))
+                return "verify: could not re-read Defender detections"
+            ok, txt = ps_json(DEFENDER_STATUS_PS, timeout=60, log=log)
+            st = parse_defender_status(
+                extract_json_text(txt) or txt) if ok else {}
+            end = st.get("quick_scan_end") if scan_type == "quick" \
+                else st.get("full_scan_end")
+            if end:
+                return "verify: Defender's last %s scan ended %s" % (
+                    scan_type, end.strftime("%Y-%m-%d %H:%M"))
+            return "verify: Defender reports no %s scan end time" \
+                % scan_type
+        if step.kind == "defender_threat_remove":
+            ok, detections = _defender_detections_now(log)
+            if not ok:
+                return "verify: could not re-read Defender detections"
+            active = [d for d in detections
+                      if d["status_id"] in THREAT_ACTIVE_STATUS_IDS]
+            if active:
+                return ("verify: %d detection(s) still marked as "
+                        "needing action" % len(active))
+            return ("verify: no detections remain marked as needing "
+                    "action")
+        if step.kind == "defender_threat_action":
+            ok, txt = ps_json(
+                "Get-MpPreference | Select-Object "
+                "ThreatIDDefaultAction_Ids, "
+                "ThreatIDDefaultAction_Actions | "
+                "ConvertTo-Json -Compress", timeout=60, log=log)
+            actions = parse_threat_default_actions(txt) if ok else {}
+            tid = step.payload.get("threat_id")
+            if tid in actions:
+                return ("verify: Defender has a standing action for "
+                        "threat %s (Defender action code %s)"
+                        % (tid, actions[tid]))
+            return ("verify: standing action NOT registered for "
+                    "threat %s — Defender may have refused it" % tid)
     except Exception:
         return None
     return None
@@ -3118,6 +3527,66 @@ def run_self_test():
               '"AntivirusSignatureAge":1}'), 0)
           .startswith("Windows Security (Microsoft Defender): "
                       "real-time protection ON"))
+    # --- v1.2.0: Defender malware scans + threat history --------
+    check("threat names parse",
+          parse_threat_names(
+              '[{"ThreatID":2147735505,'
+              '"ThreatName":"Trojan:Win32/Test",'
+              '"SeverityID":5,"CategoryID":8}]')[0]["name"]
+          == "Trojan:Win32/Test")
+    check("threat status text is honest",
+          threat_status_text(1).startswith("detected")
+          and threat_status_text(3).startswith("quarantined")
+          and threat_status_text(999).startswith("state unknown"))
+    check("threat default actions parse",
+          parse_threat_default_actions(
+              '{"ThreatIDDefaultAction_Ids":[2147735505],'
+              '"ThreatIDDefaultAction_Actions":[2]}')
+          == {2147735505: 2})
+    check("defender scan commands",
+          defender_scan_ps("quick")
+          == "Start-MpScan -ScanType QuickScan"
+          and defender_scan_ps("full")
+          == "Start-MpScan -ScanType FullScan"
+          and defender_scan_ps("custom", r"C:\Downloads")
+          == "Start-MpScan -ScanType CustomScan "
+             "-ScanPath 'C:\\Downloads'"
+          and defender_scan_ps("offline") is None
+          and defender_scan_mpcmdrun_suffix("full")
+          == "-Scan -ScanType 2")
+    _scan_kinds = set()
+    for _f in _defender_findings(
+            '{"AMServiceEnabled":true,"AntivirusEnabled":true,'
+            '"RealTimeProtectionEnabled":true,'
+            '"IsTamperProtected":true,'
+            '"AntivirusSignatureAge":0}',
+            '[{"ThreatID":2147735505,'
+            '"InitialDetectionTime":"/Date(1760313600000)/",'
+            '"ThreatStatusID":1,'
+            '"Resources":["file:_C:\\\\x\\\\bad.exe"]}]',
+            '[{"ThreatID":2147735505,'
+            '"ThreatName":"Trojan:Win32/Test"}]'):
+        if _f.fix_kind == "defender_scan":
+            _scan_kinds.add(_f.payload.get("scan_type"))
+    check("all four defender scans offered",
+          _scan_kinds == {"quick", "full", "offline"})
+    _hist = _threat_history_findings(
+        parse_threat_detections(
+            '[{"ThreatID":2147735505,'
+            '"InitialDetectionTime":"/Date(1760313600000)/",'
+            '"ThreatStatusID":1,"Resources":[]}]'),
+        {2147735505: "Trojan:Win32/Test"})
+    check("threat history names + remove offered",
+          any("Trojan:Win32/Test" in _f.title for _f in _hist)
+          and any(_f.fix_kind == "defender_threat_remove"
+                  for _f in _hist)
+          and any((_f.payload or {}).get("threat_actions")
+                  for _f in _hist))
+    check("new defender kinds are opt-in and ordered",
+          "defender_threat_remove" in OPT_IN_KINDS
+          and "defender_threat_action" in OPT_IN_KINDS
+          and FIX_ORDER["defender_scan"]
+          < FIX_ORDER["defender_threat_remove"])
 
     class _FakeEnv:
         def startup_items(self):
@@ -3614,6 +4083,72 @@ def launch_gui():
                         label, "On Windows this opens: %s" % t)
             tk.Button(action_frame, text=label, command=_open,
                       padx=12, pady=4).pack(side="left")
+        if (f.payload or {}).get("defender_folder_scan"):
+            flabel = (f.payload or {}).get(
+                "folder_scan_label", "Choose a folder to scan…")
+
+            def _folder_scan():
+                from tkinter import filedialog
+                path = filedialog.askdirectory(
+                    title="Choose a folder for Defender to scan")
+                if not path:
+                    return
+                step = FixStep(
+                    "defender_scan",
+                    "Defender folder scan: %s" % path,
+                    payload={"scan_type": "custom",
+                             "scan_path": path})
+                plan = [FixStep(
+                    "restore_point",
+                    "Create a System Restore point "
+                    "(safety snapshot)"), step]
+                confirm_and_run_plan(
+                    plan, "Scan this folder?",
+                    "Defender will scan:\n%s\n\nFIRST, a System "
+                    "Restore point is created — if that fails, "
+                    "nothing else runs. Defender makes all "
+                    "quarantine decisions; results are reported "
+                    "here afterwards." % path,
+                    "Scanning folder with Defender…")
+            tk.Button(action_frame, text=flabel,
+                      command=_folder_scan, padx=12,
+                      pady=4).pack(side="left")
+        threat_actions = (f.payload or {}).get("threat_actions")
+        if threat_actions:
+            ta = threat_actions
+
+            def _standing_action(action, ta=ta):
+                shown = ta.get("threat_name") or \
+                    "threat %s" % ta.get("threat_id")
+                step = FixStep(
+                    "defender_threat_action",
+                    "Defender standing action for %s: %s"
+                    % (shown, action),
+                    payload={"threat_id": ta.get("threat_id"),
+                             "threat_name": ta.get("threat_name")
+                             or "",
+                             "action": action})
+                plan = [FixStep(
+                    "restore_point",
+                    "Create a System Restore point "
+                    "(safety snapshot)"), step]
+                confirm_and_run_plan(
+                    plan, "Set Defender's standing action?",
+                    "This tells Defender: when you meet %s again, "
+                    "%s it.\n\nIt does NOT act on the detection "
+                    "already on record — removal is the separate "
+                    "'Remove active threats' fix in this section."
+                    "\n\nFIRST, a System Restore point is created "
+                    "— if that fails, nothing else runs."
+                    % (shown, action.lower()),
+                    "Setting Defender's standing action…")
+            tk.Label(action_frame,
+                     text="Defender's standing action for this "
+                          "threat:").pack(side="left")
+            for verb in DEFENDER_THREAT_ACTIONS:
+                tk.Button(action_frame, text=verb,
+                          command=lambda v=verb: _standing_action(v),
+                          padx=10, pady=4).pack(side="left")
         area = (f.payload or {}).get("ts_area")
         if not area and f.severity in ("warn", "bad"):
             area = TS_AREA_FOR_CATEGORY.get(f.category)
@@ -3666,33 +4201,26 @@ def launch_gui():
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def do_fix():
+    def confirm_and_run_plan(plan, confirm_title, confirm_text,
+                             busy_text):
+        """The one GUI path into execute_plan: admin check, plain
+        confirmation, worker thread, results dialog. do_fix and
+        the Defender action buttons (folder scan, per-threat
+        standing actions) all run through here, so every fix in
+        the app sits behind the same restore-point gate and the
+        same wording about it."""
         if state["busy"]:
-            return
-        chosen = [f for f in state["findings"] if f in state["checked"]]
-        if not chosen:
-            messagebox.showinfo(
-                "Nothing ticked",
-                "Tick at least one fix in the list first. Scanning "
-                "alone changes nothing.")
             return
         if IS_WINDOWS and not is_admin():
             messagebox.showwarning(
                 "Admin needed",
                 "Fixes need administrator rights. Use 'Relaunch as "
-                "admin' at the top, then scan and tick again.")
+                "admin' at the top, then try again.")
             return
-        if not messagebox.askyesno(
-                "Run these fixes?",
-                "%d fix(es) will run.\n\nFIRST, a System Restore point "
-                "is created — if that fails, nothing else runs.\nEvery "
-                "step is logged, registry removals are backed up "
-                "(.reg), and results are re-checked afterwards."
-                % len(chosen)):
+        if not messagebox.askyesno(confirm_title, confirm_text):
             return
         state["cancel"].clear()
-        plan = build_fix_plan(chosen)
-        set_busy(True, "Fixing… do not close the app during SFC/DISM.")
+        set_busy(True, busy_text)
 
         def progress(i, total, label):
             progress["maximum"] = total
@@ -3715,6 +4243,26 @@ def launch_gui():
                     "the log:\n%s" % (ok_n, len(results), log.path))))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def do_fix():
+        if state["busy"]:
+            return
+        chosen = [f for f in state["findings"] if f in state["checked"]]
+        if not chosen:
+            messagebox.showinfo(
+                "Nothing ticked",
+                "Tick at least one fix in the list first. Scanning "
+                "alone changes nothing.")
+            return
+        confirm_and_run_plan(
+            build_fix_plan(chosen),
+            "Run these fixes?",
+            "%d fix(es) will run.\n\nFIRST, a System Restore point "
+            "is created — if that fails, nothing else runs.\nEvery "
+            "step is logged, registry removals are backed up "
+            "(.reg), and results are re-checked afterwards."
+            % len(chosen),
+            "Fixing… do not close the app during SFC/DISM.")
 
     def do_report():
         if not state["findings"]:
@@ -6276,14 +6824,22 @@ def _check_threats(env, prior):
                 "matters is that you review what it found and "
                 "whether it succeeded.",
                 guide=[
+                    "In this app's main scan → Security section, "
+                    "each detection is listed by name with "
+                    "Defender's state for it: from there you can "
+                    "run Defender's own removal for anything still "
+                    "marked as needing action, and set Defender's "
+                    "standing action (quarantine / remove / allow) "
+                    "for future detections of a named threat.",
                     "Open Windows Security → Virus & threat "
                     "protection → Protection history.",
                     "Check each detection says 'Removed' or "
                     "'Quarantined' — anything 'Allowed' that you "
                     "don't recognize should be removed there.",
-                    "Run a full scan (Scan options → Full scan) "
-                    "and, for stubborn cases, the Microsoft "
-                    "Defender Offline scan on the same page.",
+                    "Run a full scan (in the Security section, or "
+                    "Windows Security → Scan options → Full scan) "
+                    "and, for stubborn cases, the Defender Offline "
+                    "scan — it restarts the PC.",
                     "Change important passwords from a CLEAN "
                     "device if any detection was a stealer-type "
                     "threat.",

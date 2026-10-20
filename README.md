@@ -138,6 +138,23 @@ Scan, update Defender signatures, and **Open Windows Security**
 (opens Windows' own security app). If Defender cannot be read, the
 app says so and says why — never a silent dead button.
 
+**Malware scanning (new in v1.2.0):** the Security section now
+offers Defender's full scan set, each behind the same
+restore-point gate as every fix: a **Quick Scan**, a **Full Scan**,
+a **folder scan** (pick any folder — a downloads folder, a USB
+stick), and the **Offline Scan**, which *restarts the PC* to scan
+before Windows loads (the finding says so in plain words, and the
+app honestly cannot verify that one — its result is read in
+Windows Security → Protection history). Detections are listed as a
+**threat history, by name**, with Defender's own state for each
+one (quarantined / removed / still needs action) — live from
+Defender, never a copy this app keeps. From the history you can
+run Defender's own removal for anything still active, and set
+Defender's **standing action** (quarantine / remove / allow) for
+future detections of a named threat. Defender decides what
+quarantine and removal mean; this app reports Defender's state
+and never invents its own.
+
 **Malwarebytes** is supported as a second-opinion scanner, and its
 card sits directly under the Defender summary: if Malwarebytes is
 installed, the app offers to launch it; if not, the card explains

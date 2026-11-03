@@ -50,7 +50,7 @@ import urllib.error
 import urllib.request
 
 APP_NAME = "Windows Health & Repair"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 
 IS_WINDOWS = sys.platform.startswith("win")
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
@@ -64,6 +64,7 @@ CATEGORIES = [
     ("boot", "Boot performance"),
     ("update", "Windows Update"),
     ("security", "Security posture"),
+    ("sweep", "Security + error sweep"),
     ("devices", "Drivers & devices"),
     ("startup", "Startup programs"),
     ("events", "Recent system errors"),
@@ -2392,8 +2393,12 @@ SCANNERS = [
 # scan_boot / scan_programs are defined further down (feature pack) and
 # register themselves into SCANNERS at import time, in display order.
 
+# v1.3.0: per-run diagnostic-sweep context (see run_scan / scan_sweep).
+_SWEEP_LOCAL = threading.local()
 
-def run_scan(log, progress=None, only=None, on_findings=None):
+
+def run_scan(log, progress=None, only=None, on_findings=None,
+             sweep_ctx=None):
     """Run all scanners; one scanner failing never kills the scan.
 
     on_findings(batch), when given, is called with each scanner's
@@ -2403,31 +2408,50 @@ def run_scan(log, progress=None, only=None, on_findings=None):
     end; see docs/AUDITS.md, 2026-10-20 addendum). Per-check start /
     finish lines go to the log so a stall is pinpointed by the log's
     last line.
+
+    sweep_ctx (v1.3.0) carries the diagnostic-sweep context for the
+    sweep stage (scan_sweep, registered last): per-run depth
+    override, headless flag, second-opinion launch permission. It
+    travels through a thread-local so scanner signatures stay
+    fn(log); run_scan also records the categories that completed
+    without raising into it ("completed_categories"), so the sweep
+    stage can honestly report whether the error checks ran.
     """
+    ctx = dict(sweep_ctx) if sweep_ctx else {}
+    ctx.setdefault("completed_categories", [])
+    ctx["only"] = list(only) if only else None
+    _SWEEP_LOCAL.ctx = ctx
     findings = []
-    for i, (cat, fn) in enumerate(SCANNERS):
-        if only and cat not in only:
-            continue
-        if progress:
-            progress(cat, i, len(SCANNERS))
-        log("Check %d/%d: %s" % (i + 1, len(SCANNERS),
-                                 CATEGORY_TITLES.get(cat, cat)))
-        started = time.monotonic()
-        try:
-            batch = fn(log)
-        except Exception as exc:  # honest failure entry, never a crash
-            batch = [Finding(
-                cat, "This check failed to run: %s" % exc,
-                detail="The failure was recorded in the log. Other "
-                       "checks are unaffected.",
-                severity="warn")]
-            log("Scanner %s raised: %r" % (cat, exc))
-        findings.extend(batch)
-        log("Check %s finished in %.0fs — %d finding(s)." % (
-            CATEGORY_TITLES.get(cat, cat), time.monotonic() - started,
-            len(batch)))
-        if on_findings:
-            on_findings(batch)
+    try:
+        for i, (cat, fn) in enumerate(SCANNERS):
+            if only and cat not in only:
+                continue
+            if progress:
+                progress(cat, i, len(SCANNERS))
+            log("Check %d/%d: %s" % (i + 1, len(SCANNERS),
+                                     CATEGORY_TITLES.get(cat, cat)))
+            started = time.monotonic()
+            raised = False
+            try:
+                batch = fn(log)
+            except Exception as exc:  # honest failure, never a crash
+                raised = True
+                batch = [Finding(
+                    cat, "This check failed to run: %s" % exc,
+                    detail="The failure was recorded in the log. Other "
+                           "checks are unaffected.",
+                    severity="warn")]
+                log("Scanner %s raised: %r" % (cat, exc))
+            if not raised:
+                ctx["completed_categories"].append(cat)
+            findings.extend(batch)
+            log("Check %s finished in %.0fs — %d finding(s)." % (
+                CATEGORY_TITLES.get(cat, cat),
+                time.monotonic() - started, len(batch)))
+            if on_findings:
+                on_findings(batch)
+    finally:
+        _SWEEP_LOCAL.ctx = None
     return findings
 
 
@@ -3824,6 +3848,54 @@ def run_self_test():
           any(e.get("result") == "repaired"
               for e in load_repair_events(
                   path=os.path.join(_rdir, REPAIR_EVENTS_FILE))))
+    # --- v1.3.0: diagnostic security + error sweep ------------------
+    _ds = default_diagnostic_settings()
+    check("diagnostic settings defaults",
+          _ds["defender_depth"] == "quick"
+          and _ds["full_cadence"] == "monthly"
+          and _ds["second_opinion"] == "malwarebytes"
+          and _ds["auto_check_sweep"] is True
+          and _ds["sweep_state"] == {"runs": 0, "last_full": None})
+    check("sweep depth: first run is full",
+          decide_sweep_depth(_ds)[0] == "full")
+    _ds2 = default_diagnostic_settings()
+    _ds2["sweep_state"] = {"runs": 3, "last_full": "2020-01-01"}
+    _ds3 = default_diagnostic_settings()
+    _ds3["sweep_state"] = {"runs": 3,
+                           "last_full": datetime.date.today()
+                           .isoformat()}
+    check("sweep depth: cadence rotation",
+          decide_sweep_depth(_ds2)[0] == "full"
+          and decide_sweep_depth(_ds3)[0] == "quick")
+    _ds4 = default_diagnostic_settings()
+    _ds4["defender_depth"] = "custom"
+    _ds4["custom_targets"] = [r"C:\Downloads"]
+    _ds5 = default_diagnostic_settings()
+    _ds5["defender_depth"] = "custom"
+    check("sweep depth: custom needs saved targets",
+          decide_sweep_depth(_ds4)[0] == "custom"
+          and decide_sweep_depth(_ds5)[0] == "quick")
+    check("sweep summary: complete when every leg reported",
+          sweep_summary({"state": "ran", "depth": "full"},
+                        {"state": "off", "detail": "off"},
+                        {"state": "ran"})[0]
+          .startswith("Diagnostic sweep: COMPLETE"))
+    check("sweep summary: a silent leg is incomplete, never clean",
+          sweep_summary({"state": "ran", "depth": "quick"},
+                        {}, {"state": "ran"})[1] == "warn"
+          and sweep_summary({"state": "failed", "detail": "x"},
+                            {"state": "absent"},
+                            {"state": "ran"})[0]
+          .startswith("Diagnostic sweep: INCOMPLETE"))
+    check("sweep stage registered last",
+          SCANNERS[-1][0] == "sweep"
+          and CATEGORY_TITLES["sweep"] == "Security + error sweep")
+    _dspath = os.path.join(_tmp, "diagnostic-settings.json")
+    with open(_dspath, "w", encoding="utf-8") as _fh:
+        _fh.write("{corrupt")
+    check("sweep settings store self-repairs to defaults",
+          load_diagnostic_settings(_dspath)
+          == default_diagnostic_settings())
 
     print("%s %s — self-test" % (APP_NAME, APP_VERSION))
     print("Platform: %s | Windows: %s | Admin: %s | Python: %s"
@@ -3900,6 +3972,8 @@ def launch_gui():
         "busy": False, "cancel": threading.Event(),
         "fix_results": None,
         "update_info": None, "upd_busy": False,
+        # v1.3.0: per-run sweep override (None = Auto, use settings).
+        "sweep_override": None, "sweep_custom_path": None,
     }
     log_queue = queue_mod.Queue()
     log = RunLog(sink=lambda line: log_queue.put(line))
@@ -3960,6 +4034,27 @@ def launch_gui():
     tk.Label(btns2, textvariable=monthly_var, bg=bg, fg="#9aa3b2",
              font=("Sans", 9)).pack(side="left", padx=10)
 
+    # v1.3.0: diagnostic sweep controls — per-run depth override plus
+    # the two persisted choices (full-sweep cadence, second opinion).
+    btns_sweep = tk.Frame(root, bg=bg)
+    btns_sweep.pack(fill="x", padx=16, pady=(0, 2))
+    sweep_depth_btn = tk.Button(btns_sweep, text="Sweep depth: Auto",
+                                padx=12, pady=4)
+    sweep_depth_btn.pack(side="left")
+    sweep_cadence_btn = tk.Button(btns_sweep,
+                                  text="Full sweep every: Monthly",
+                                  padx=12, pady=4)
+    sweep_cadence_btn.pack(side="left", padx=4)
+    sweep_opinion_btn = tk.Button(btns_sweep,
+                                  text="Second opinion: Malwarebytes",
+                                  padx=12, pady=4)
+    sweep_opinion_btn.pack(side="left", padx=4)
+    tk.Label(btns_sweep,
+             text="Every diagnostic scan ends with the sweep: a real "
+                  "Defender scan + the error checks, one result.",
+             bg=bg, fg="#9aa3b2", font=("Sans", 9)).pack(side="left",
+                                                         padx=10)
+
     btns3 = tk.Frame(root, bg=bg)
     btns3.pack(fill="x", padx=16, pady=(0, 2))
     ts_btn = tk.Button(btns3, text="Troubleshoot a problem…",
@@ -3992,8 +4087,10 @@ def launch_gui():
     progress = ttk.Progressbar(root, mode="determinate")
     progress.pack(fill="x", padx=16, pady=(2, 2))
     status_var = tk.StringVar(
-        value="Press 'Scan this PC'. Scanning only reads — nothing is "
-              "changed until you tick fixes and press Fix.")
+        value="Press 'Scan this PC'. A scan runs real checks — "
+              "including a Defender malware scan (the sweep) — but "
+              "changes nothing itself: fixes run only for the items "
+              "you tick.")
     tk.Label(root, textvariable=status_var, bg=bg, fg="#9aa3b2",
              font=("Sans", 10)).pack(fill="x", padx=16)
 
@@ -4037,6 +4134,9 @@ def launch_gui():
         scan_btn.configure(state="disabled" if busy else "normal")
         fix_btn.configure(state="disabled" if busy else "normal")
         cancel_btn.configure(state="normal" if busy else "disabled")
+        for btn in (sweep_depth_btn, sweep_cadence_btn,
+                    sweep_opinion_btn):
+            btn.configure(state="disabled" if busy else "normal")
         if label:
             status_var.set(label)
 
@@ -4284,10 +4384,16 @@ def launch_gui():
 
         root.after(1000, watchdog)
 
+        sweep_ctx = {"headless": False,
+                     "launch_second_opinion": True,
+                     "override_depth": state.get("sweep_override"),
+                     "custom_path": state.get("sweep_custom_path")}
+
         def worker():
             try:
                 findings = run_scan(log, progress=scan_progress,
-                                    on_findings=stream)
+                                    on_findings=stream,
+                                    sweep_ctx=sweep_ctx)
             except Exception:
                 etype, evalue, etb = sys.exc_info()
                 log("Scan failed unexpectedly: %r" % (evalue,))
@@ -4516,6 +4622,59 @@ def launch_gui():
                 "Schedule set to %s — it takes effect when you "
                 "turn the auto-check on." % mode)
         refresh_monthly()
+
+    def refresh_sweep_buttons():
+        override = state.get("sweep_override")
+        if override == "custom":
+            depth_label = "Custom folder…"
+        elif override:
+            depth_label = override.capitalize()
+        else:
+            depth_label = "Auto"
+        sweep_depth_btn.configure(text="Sweep depth: %s" % depth_label)
+        settings = load_diagnostic_settings()
+        sweep_cadence_btn.configure(
+            text="Full sweep every: %s"
+                 % settings["full_cadence"].capitalize())
+        sweep_opinion_btn.configure(
+            text="Second opinion: %s"
+                 % ("Malwarebytes"
+                    if settings["second_opinion"] == "malwarebytes"
+                    else "Off"))
+
+    def do_sweep_depth():
+        order = [None, "quick", "full", "custom"]
+        cur = state.get("sweep_override")
+        nxt = order[(order.index(cur) + 1) % len(order)] \
+            if cur in order else None
+        if nxt == "custom":
+            from tkinter import filedialog
+            path = filedialog.askdirectory(
+                title="Choose a folder for the sweep's Defender "
+                      "scan")
+            if not path:
+                return  # cancelled — keep the current choice
+            state["sweep_custom_path"] = path
+        state["sweep_override"] = nxt
+        refresh_sweep_buttons()
+
+    def do_sweep_cadence():
+        settings = load_diagnostic_settings()
+        order = ["weekly", "monthly", "never"]
+        cur = settings["full_cadence"]
+        settings["full_cadence"] = \
+            order[(order.index(cur) + 1) % len(order)] \
+            if cur in order else "monthly"
+        save_diagnostic_settings(settings)
+        refresh_sweep_buttons()
+
+    def do_sweep_opinion():
+        settings = load_diagnostic_settings()
+        settings["second_opinion"] = (
+            "off" if settings["second_opinion"] == "malwarebytes"
+            else "malwarebytes")
+        save_diagnostic_settings(settings)
+        refresh_sweep_buttons()
 
     def do_preventative():
         if state["busy"]:
@@ -5128,6 +5287,9 @@ def launch_gui():
     cert_btn.configure(command=do_certificate)
     monthly_btn.configure(command=do_monthly)
     mode_btn.configure(command=do_mode)
+    sweep_depth_btn.configure(command=do_sweep_depth)
+    sweep_cadence_btn.configure(command=do_sweep_cadence)
+    sweep_opinion_btn.configure(command=do_sweep_opinion)
     ts_btn.configure(command=lambda: open_troubleshooter())
     prev_btn.configure(command=do_preventative)
     upd_check_btn.configure(command=do_check_updates)
@@ -5135,6 +5297,7 @@ def launch_gui():
     upd_no_btn.configure(command=do_dismiss_update)
     crash_btn.configure(command=open_crash_reports)
     refresh_monthly()
+    refresh_sweep_buttons()
 
     if IS_WINDOWS and is_admin():
         admin_var.set("Administrator ✓")
@@ -5781,7 +5944,8 @@ def cmd_scan_only():
         return 2
     log("Auto-check (scan-only — no fixes are ever run headless). "
         "Schedule mode: %s." % auto_check_mode())
-    findings = run_scan(log)
+    findings = run_scan(log, sweep_ctx={"headless": True,
+                                        "launch_second_opinion": False})
     summary = summarize_findings(findings)
     prev = record_history(summary)
     comparison = diff_summaries(prev, summary)
@@ -7858,6 +8022,78 @@ def auto_check_schtasks_args(mode, action, task_name=None):
     return args
 
 
+# ---- diagnostic sweep settings (v1.3.0): depth / cadence / second
+# opinion — the owner's options-reserved ruling (2026-11-02): every
+# choice here is a starting default he can change, never a hard-coded
+# policy. The store rides the same self-repairing JSON path as every
+# other store in the app (see load_json_store below).
+
+DIAGNOSTIC_SETTINGS_FILE = "diagnostic-settings.json"
+SWEEP_DEPTHS = ("quick", "full", "custom")
+SWEEP_CADENCES = ("weekly", "monthly", "never")
+SECOND_OPINIONS = ("malwarebytes", "off")
+AUTO_CHECK_DEPTHS = ("quick", "full", "custom")
+
+
+def default_diagnostic_settings():
+    return {
+        "defender_depth": "quick",
+        "custom_targets": [],
+        "full_cadence": "monthly",
+        "second_opinion": "malwarebytes",
+        "auto_check_sweep": True,
+        "auto_check_depth": "quick",
+        "sweep_state": {"runs": 0, "last_full": None},
+    }
+
+
+def diagnostic_settings_path():
+    return os.path.join(app_dir(), DIAGNOSTIC_SETTINGS_FILE)
+
+
+def load_diagnostic_settings(path=None):
+    return load_json_store(path or diagnostic_settings_path(),
+                           _salvage_diagnostic_settings,
+                           default_diagnostic_settings,
+                           DIAGNOSTIC_SETTINGS_FILE)
+
+
+def save_diagnostic_settings(settings, path=None):
+    """Validate + save the diagnostic-sweep settings. Unknown enum
+    values raise ValueError (same contract as save_auto_check_mode);
+    the store is rebuilt canonically by the salvage function before
+    anything is written."""
+    if not isinstance(settings, dict):
+        raise ValueError("diagnostic settings must be a mapping")
+    cleaned = _salvage_diagnostic_settings(settings)
+    if cleaned is None:
+        raise ValueError("diagnostic settings must be a mapping")
+    for key, allowed in (("defender_depth", SWEEP_DEPTHS),
+                         ("full_cadence", SWEEP_CADENCES),
+                         ("second_opinion", SECOND_OPINIONS),
+                         ("auto_check_depth", AUTO_CHECK_DEPTHS)):
+        raw = (settings or {}).get(key)
+        if raw is not None and raw not in allowed:
+            raise ValueError("unknown %s: %s" % (key, raw))
+    if not isinstance((settings or {}).get(
+            "custom_targets", []), list):
+        raise ValueError("custom_targets must be a list of folders")
+    state = (settings or {}).get("sweep_state")
+    if state is not None:
+        if not isinstance(state, dict):
+            raise ValueError("sweep_state must be a mapping")
+        runs = state.get("runs", 0)
+        if not isinstance(runs, int) or isinstance(runs, bool) \
+                or runs < 0:
+            raise ValueError("sweep_state.runs must be a count")
+        last_full = state.get("last_full")
+        if last_full is not None and not isinstance(last_full, str):
+            raise ValueError("sweep_state.last_full must be a date "
+                             "or null")
+    save_json_store(path or diagnostic_settings_path(), cleaned)
+    return cleaned
+
+
 # ----------------------------------------------------------------------
 # Self-repair of the app's own state (v1.1.1) — the standing rule
 # (2026-10-17): recoverable problems in the app's OWN state are
@@ -8036,6 +8272,40 @@ def _salvage_auto_check(data):
         return None
     mode = data.get("mode")
     return {"mode": mode if mode in AUTO_CHECK_MODES else "monthly"}
+
+
+def _salvage_diagnostic_settings(data):
+    """Canonical diagnostic-sweep settings from whatever was on
+    disk: keep every valid value, rebuild the rest from defaults.
+    An unusable shape (not a mapping) returns None so the store
+    falls back to its .bak / defaults like every other store."""
+    if not isinstance(data, dict):
+        return None
+    out = default_diagnostic_settings()
+    if data.get("defender_depth") in SWEEP_DEPTHS:
+        out["defender_depth"] = data["defender_depth"]
+    targets = data.get("custom_targets")
+    if isinstance(targets, list):
+        out["custom_targets"] = [t for t in targets
+                                 if isinstance(t, str) and t]
+    if data.get("full_cadence") in SWEEP_CADENCES:
+        out["full_cadence"] = data["full_cadence"]
+    if data.get("second_opinion") in SECOND_OPINIONS:
+        out["second_opinion"] = data["second_opinion"]
+    if isinstance(data.get("auto_check_sweep"), bool):
+        out["auto_check_sweep"] = data["auto_check_sweep"]
+    if data.get("auto_check_depth") in AUTO_CHECK_DEPTHS:
+        out["auto_check_depth"] = data["auto_check_depth"]
+    state = data.get("sweep_state")
+    if isinstance(state, dict):
+        runs = state.get("runs")
+        if isinstance(runs, int) and not isinstance(runs, bool) \
+                and runs >= 0:
+            out["sweep_state"]["runs"] = runs
+        last_full = state.get("last_full")
+        if isinstance(last_full, str) and last_full:
+            out["sweep_state"]["last_full"] = last_full
+    return out
 
 
 def _salvage_preventative(data):
@@ -8665,6 +8935,390 @@ def delete_crash_report(path):
         return True
     except OSError:
         return False
+
+
+# ----------------------------------------------------------------------
+# Diagnostic security + error sweep (v1.3.0) — the fleet rule (owner,
+# 2026-11-02): no diagnostic is complete without a real virus/malware
+# scan plus the system-file/event-log error checks, all reported in
+# the same plain-language result. The sweep is the LAST scanner in
+# run_scan (both entry points: "Scan this PC" and the headless
+# auto-check). It reuses the v1.2.0 Defender machinery
+# (fix_defender_scan) — no new scan engine, no homemade AV.
+#
+# A scan is not a fix: the sweep leg deliberately does NOT sit behind
+# the restore-point gate. Defender's own policy decides what happens
+# to a detection (quarantine is Defender's call, reported as
+# Defender's); this app deletes and quarantines nothing itself, and
+# every repair stays behind the gate exactly as before. The Offline
+# scan is NEVER a sweep depth — it restarts the PC, so it stays an
+# explicit, warned, per-run fix choice in the Security section.
+# ----------------------------------------------------------------------
+
+def decide_sweep_depth(settings, today=None):
+    """Pure: (depth, reason) for the next diagnostic sweep.
+
+    depth is "quick" | "full" | "custom". Rules, in order: a custom
+    default with saved targets scans those; a full default stays
+    full; the FIRST diagnostic ever runs full (owner's starting
+    default, 2026-11-02); after that, full rotates back on the
+    configured cadence (weekly >= 7 days, monthly >= 28 days since
+    the last full sweep; a missing last_full counts as due);
+    otherwise quick. Per-run overrides are the caller's business.
+    """
+    settings = settings or {}
+    today = today or datetime.date.today()
+    base = settings.get("defender_depth") or "quick"
+    if base == "custom":
+        if settings.get("custom_targets"):
+            return "custom", "your setting: scan the saved folder(s)"
+        return "quick", ("custom depth is set but no folder is "
+                         "saved — quick scan instead")
+    if base == "full":
+        return "full", "your setting: full scan"
+    state = settings.get("sweep_state") or {}
+    if not state.get("runs"):
+        return "full", "first diagnostic run"
+    cadence = settings.get("full_cadence") or "monthly"
+    if cadence in ("weekly", "monthly"):
+        last_full = state.get("last_full")
+        due_days = 7 if cadence == "weekly" else 28
+        label = "weekly" if cadence == "weekly" else "monthly"
+        if not last_full:
+            return "full", "full scan due (%s rotation)" % label
+        try:
+            last = datetime.date.fromisoformat(str(last_full)[:10])
+        except ValueError:
+            return "full", "full scan due (%s rotation)" % label
+        if (today - last).days >= due_days:
+            return "full", ("full scan due (%s rotation — last full "
+                            "sweep %s)" % (label, last_full))
+    return "quick", "quick scan (full sweep on your %s rotation)" \
+        % cadence
+
+
+def sweep_summary(defender, opinion, error):
+    """Pure: the completeness verdict for one diagnostic sweep.
+
+    Each leg is a dict with a "state" (plus "depth" for the Defender
+    leg and a plain "detail"). Returns (title, severity). The rule
+    (HQ-approved): a leg that produced no result at all makes the
+    diagnostic INCOMPLETE — never "clean". A leg whose state is
+    honestly reported (second opinion launched / installed / not
+    installed / off by the user's own setting) is complete WITH
+    that disclosure.
+    """
+    defender = defender or {}
+    opinion = opinion or {}
+    error = error or {}
+    problems = []
+    d_state = defender.get("state")
+    if d_state == "off":
+        problems.append("the malware sweep is off in settings for "
+                        "auto-checks — this run was status-only, "
+                        "per your setting")
+    elif d_state != "ran":
+        problems.append("the Defender scan did not run (%s)"
+                        % (defender.get("detail")
+                           or "no result was reported"))
+    o_state = opinion.get("state")
+    if o_state not in ("launched", "installed", "absent", "off"):
+        problems.append("the second-opinion check reported no "
+                        "result (%s)"
+                        % (opinion.get("detail")
+                           or "no result was reported"))
+    e_state = error.get("state")
+    if e_state != "ran":
+        problems.append("the system-file / error-log checks did "
+                        "not run (%s)"
+                        % (error.get("detail")
+                           or "no result was reported"))
+    if problems:
+        return ("Diagnostic sweep: INCOMPLETE — "
+                + "; ".join(problems) + ".", "warn")
+    return ("Diagnostic sweep: COMPLETE — Defender %s scan ran, "
+            "second opinion %s, system-file + error checks ran."
+            % (defender.get("depth") or "quick",
+               opinion.get("detail") or o_state), "info")
+
+
+def _sweep_ctx():
+    ctx = getattr(_SWEEP_LOCAL, "ctx", None)
+    return ctx if isinstance(ctx, dict) else {}
+
+
+def scan_sweep(log):
+    """The sweep stage — runs last in run_scan. See the section
+    header above for the rules; every leg reports its own state and
+    the final finding is the completeness verdict."""
+    ctx = _sweep_ctx()
+    headless = bool(ctx.get("headless"))
+    settings = load_diagnostic_settings()
+    completed = set(ctx.get("completed_categories") or [])
+    only = ctx.get("only")
+    if only is not None and ("sysfiles" not in only
+                             or "events" not in only):
+        error_leg = {"state": "excluded",
+                     "detail": "the system-file / error-log checks "
+                               "were not part of this run"}
+    elif "sysfiles" in completed and "events" in completed:
+        error_leg = {"state": "ran"}
+    else:
+        error_leg = {"state": "failed",
+                     "detail": "one of the error checks failed to "
+                               "run — see its own finding above"}
+    if headless and not settings.get("auto_check_sweep", True):
+        title, severity = sweep_summary(
+            {"state": "off"}, {"state": "off"}, error_leg)
+        return [
+            Finding("sweep", "Sweep leg skipped in auto-check "
+                    "(your setting)",
+                    detail="The headless auto-check ran status-only "
+                           "because the diagnostic sweep is turned "
+                           "off for auto-checks in the app settings. "
+                           "No malware scan ran in this check.",
+                    severity="info"),
+            Finding("sweep", title,
+                    detail="Turn the sweep on for auto-checks in "
+                           "the app settings (diagnostic sweep "
+                           "settings, saved next to the app) if "
+                           "scheduled checks should scan too.",
+                    severity=severity)]
+    if not IS_WINDOWS:
+        title, severity = sweep_summary(
+            {"state": "unavailable",
+             "detail": "needs Windows — nothing was scanned"},
+            {"state": "unavailable",
+             "detail": "needs Windows"},
+            {"state": "unavailable",
+             "detail": "needs Windows"})
+        return [
+            needs_windows_finding("sweep",
+                                  "Diagnostic security + error sweep"),
+            Finding("sweep", title,
+                    detail="On a Windows PC this stage runs a real "
+                           "Defender scan, reports the second-"
+                           "opinion state, and confirms the system-"
+                           "file + error checks ran. Nothing was "
+                           "scanned here and nothing was faked.",
+                    severity=severity)]
+
+    out = []
+
+    # --- Defender leg ------------------------------------------------
+    if headless:
+        base = dict(settings)
+        base["defender_depth"] = settings.get("auto_check_depth") \
+            or "quick"
+        depth, reason = decide_sweep_depth(base)
+    else:
+        depth, reason = decide_sweep_depth(settings)
+    override = ctx.get("override_depth")
+    if override in SWEEP_DEPTHS:
+        depth = override
+        reason = "chosen for this run"
+        if depth == "custom" and ctx.get("custom_path"):
+            settings = dict(settings)
+            settings["custom_targets"] = [ctx["custom_path"]]
+    started = datetime.datetime.now()
+    t0 = time.monotonic()
+    log("Sweep: Defender %s scan (%s)." % (depth, reason))
+    if depth == "custom":
+        targets = [ctx["custom_path"]] if ctx.get("custom_path") \
+            else list(settings.get("custom_targets") or [])
+    else:
+        targets = [""]
+    if depth == "custom" and not targets:
+        defender_leg = {"state": "failed", "depth": "custom",
+                        "detail": "no folder was chosen for the "
+                                  "custom scan"}
+        out.append(Finding(
+            "sweep", "Defender folder scan did not run — no folder "
+            "chosen",
+            detail="The sweep depth is 'custom' but neither this "
+                   "run nor the saved settings name a folder. Pick "
+                   "a folder with the 'Sweep depth' button (Custom "
+                   "folder…) or save target folders in the sweep "
+                   "settings, then scan again.",
+            severity="warn"))
+    else:
+        results = []
+        for target in targets:
+            step = FixStep("defender_scan",
+                           "Defender %s scan" % depth,
+                           payload={"scan_type": depth,
+                                    "scan_path": target})
+            try:
+                results.append(fix_defender_scan(step, log))
+            except Exception as exc:  # honest failure, never a crash
+                log("Sweep Defender scan raised: %r" % (exc,))
+                results.append((False, "the Defender scan raised "
+                                       "an error: %s" % exc))
+        elapsed = human_duration(time.monotonic() - t0)
+        if all(ok for ok, _msg in results):
+            defender_leg = {"state": "ran", "depth": depth}
+            detail = " ".join(msg for _ok, msg in results)
+            if depth == "custom":
+                detail += " Folders scanned: %s." % ", ".join(targets)
+            detail += (" (Started %s, took %s. This scan ran as "
+                       "part of the diagnostic — no restore point "
+                       "is created for a scan, because a scan "
+                       "changes nothing itself: anything Defender "
+                       "does about a detection is Defender's own "
+                       "policy, reported above. Repairs remain "
+                       "behind the restore-point gate.)"
+                       % (started.strftime("%H:%M"), elapsed))
+            out.append(Finding(
+                "sweep",
+                "Diagnostic sweep: Defender %s scan ran (%s)"
+                % (depth, reason),
+                detail=detail,
+                severity="warn" if "NEW detection" in detail
+                else "info"))
+            # Only a completed Defender leg counts as a sweep run —
+            # a failed first run stays "first" and retries full.
+            state_now = dict(settings.get("sweep_state") or {})
+            state_now["runs"] = int(state_now.get("runs") or 0) + 1
+            if depth == "full":
+                state_now["last_full"] = datetime.date.today() \
+                    .isoformat()
+            updated = dict(settings)
+            updated["sweep_state"] = state_now
+            try:
+                save_diagnostic_settings(updated)
+            except (ValueError, OSError) as exc:
+                log("Sweep: could not save sweep state: %r"
+                    % (exc,))
+        else:
+            failed = [msg for ok, msg in results if not ok]
+            defender_leg = {"state": "failed", "depth": depth,
+                            "detail": failed[0] if failed
+                            else "the scan did not complete"}
+            out.append(Finding(
+                "sweep", "Diagnostic sweep: Defender %s scan did "
+                "not complete" % depth,
+                detail=" ".join(failed)
+                + " The diagnostic is therefore INCOMPLETE — "
+                  "a scan that did not finish is never reported "
+                  "as clean.",
+                severity="warn"))
+
+    # --- Second-opinion leg ------------------------------------------
+    if settings.get("second_opinion") == "off":
+        opinion_leg = {"state": "off",
+                       "detail": "off (your setting)"}
+        out.append(Finding(
+            "sweep", "Second opinion: off (your setting)",
+            detail="You turned the second-opinion check off in "
+                   "the sweep settings, so no second scanner was "
+                   "involved in this diagnostic. Defender above is "
+                   "the only engine that ran.",
+            severity="info"))
+    else:
+        try:
+            entries = enum_uninstall_entries()
+        except Exception as exc:
+            log("Sweep: uninstall enumeration raised: %r" % (exc,))
+            entries = []
+        mb = find_malwarebytes(entries)
+        if not mb:
+            opinion_leg = {"state": "absent",
+                           "detail": "not installed"}
+            out.append(Finding(
+                "sweep", "Second opinion: Malwarebytes is not "
+                "installed",
+                detail="No second-opinion scan could run. The "
+                       "Security section above has the suggestion "
+                       "card with the official download — nothing "
+                       "is downloaded unless you tap it.",
+                severity="info"))
+        else:
+            exe = find_malwarebytes_exe(mb)
+            if headless:
+                opinion_leg = {"state": "installed",
+                               "detail": "installed (not launched "
+                                         "by the auto-check)"}
+                out.append(Finding(
+                    "sweep", "Second opinion: Malwarebytes is "
+                    "installed — not launched by the auto-check",
+                    detail="The headless auto-check never opens "
+                           "apps, so no second-opinion scan ran "
+                           "in this check. Run it from the app "
+                           "or Malwarebytes itself — and know that "
+                           "its results live in Malwarebytes: this "
+                           "app cannot read them, so this leg is "
+                           "never reported as verified clean.",
+                    severity="info"))
+            elif ctx.get("launch_second_opinion", True) and exe:
+                launched = False
+                try:
+                    subprocess.Popen([exe])
+                    launched = True
+                except OSError as exc:
+                    log("Sweep: Malwarebytes launch failed: %r"
+                        % (exc,))
+                if launched:
+                    opinion_leg = {"state": "launched",
+                                   "detail": "Malwarebytes launched "
+                                             "(results not readable "
+                                             "by this app)"}
+                    out.append(Finding(
+                        "sweep", "Second opinion: Malwarebytes "
+                        "launched",
+                        detail="Malwarebytes was opened for you — "
+                               "run its scan there. Its results "
+                               "live in Malwarebytes itself and "
+                               "this app CANNOT read them, so this "
+                               "leg is not verified clean by this "
+                               "app; it is reported as launched, "
+                               "nothing more.",
+                        severity="info"))
+                else:
+                    opinion_leg = {"state": "installed",
+                                   "detail": "installed (launch "
+                                             "failed)"}
+                    out.append(Finding(
+                        "sweep", "Second opinion: Malwarebytes is "
+                        "installed but could not be launched",
+                        detail="Launch it from the Start menu for "
+                               "a second-opinion scan. Its results "
+                               "live in Malwarebytes itself — this "
+                               "app cannot read them.",
+                        severity="warn"))
+            else:
+                opinion_leg = {"state": "installed",
+                               "detail": "installed (not launched)"}
+                out.append(Finding(
+                    "sweep", "Second opinion: Malwarebytes is "
+                    "installed",
+                    detail="It was not launched for this run. "
+                           "Launch it any time from the Security "
+                           "section card or the Start menu — its "
+                           "results live in Malwarebytes itself; "
+                           "this app cannot read them.",
+                    severity="info"))
+
+    # --- Completeness verdict (always the last finding) --------------
+    title, severity = sweep_summary(defender_leg, opinion_leg,
+                                    error_leg)
+    out.append(Finding(
+        "sweep", title,
+        detail="Depth for the next run is chosen with the 'Sweep "
+               "depth' button; how often a full sweep runs and "
+               "whether the second-opinion check takes part are "
+               "your choices in the app settings (the sweep "
+               "buttons under the scan controls; the settings are "
+               "saved next to the app). One combined result: this "
+               "sweep section plus every check above.",
+        severity=severity))
+    log("Sweep: %s" % title)
+    return out
+
+
+# The sweep stage is always LAST in the scan: it reports on legs the
+# earlier stages ran. (The feature-pack registrations below insert
+# mid-list by category, so appending here keeps the sweep last.)
+SCANNERS.append(("sweep", scan_sweep))
 
 
 # Feature-pack scanners register into SCANNERS in display order

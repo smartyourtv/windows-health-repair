@@ -326,3 +326,63 @@ updated IN PLACE to the same bytes (post-upload size + MD5 verified).
 Honest limits: not proven on real Windows — the owner's install
 (v1.1.1 → v1.2.1 via the in-app updater or the Drive setup file)
 remains the test.
+
+## v1.3.0 — diagnostic security + error sweep (2026-11-02) — NOT YET RELEASED
+
+Implements the owner's fleet rule (2026-11-02, "Make it so"): no
+diagnostic is complete without a real virus/malware scan plus the
+system-file/event-log error checks, in one plain-language result.
+Plan + audits: docs/AUDITS.md, 2026-11-02 addendum. Built locally;
+**release (CI + GitHub + Drive) is a separate ship step — nothing
+below claims a published v1.3.0.**
+
+- [x] New final scan stage "Security + error sweep" (scan_sweep,
+      registered last in SCANNERS) covering both run_scan entry
+      points: "Scan this PC" and the headless auto-check. Three
+      legs + a completeness verdict (sweep_summary): COMPLETE only
+      when the Defender leg ran, the second-opinion leg reported
+      its state, and the error checks ran; a leg with no result =
+      INCOMPLETE, never "clean".
+- [x] Defender leg reuses fix_defender_scan (Start-MpScan /
+      MpCmdRun fallback, existing timeouts). Depth decided by the
+      pure decide_sweep_depth: first-ever diagnostic = FULL
+      (owner's starting default), then quick with full rotating on
+      cadence (weekly ≥ 7 d / monthly ≥ 28 d / never); stored
+      default depth can be full or custom (saved folder targets,
+      run in sequence). A scan is not a fix, so no restore point
+      is created for the leg — the finding says so and says
+      detections are Defender's own policy decisions. Only a
+      completed leg counts a run in sweep_state (failed first run
+      retries full next time). Offline scan is never a sweep depth.
+- [x] Second-opinion leg (owner decision: launch-only): installed
+      + GUI → Malwarebytes launched, reported as launched with
+      "this app CANNOT read its results — not verified clean";
+      headless → installed-not-launched; absent → not installed
+      (download button stays on the Security card only);
+      off → "off (your setting)".
+- [x] Settings: diagnostic-settings.json on the existing
+      self-repairing store path (+ salvage + validating save).
+      GUI: "Sweep depth: Auto/Quick/Full/Custom folder…" per-run
+      override, "Full sweep every: Weekly/Monthly/Never" and
+      "Second opinion: Malwarebytes/Off" persisted toggles — the
+      shipped values are starting defaults (owner's
+      options-reserved ruling), all changeable.
+- [x] Version 1.3.0 in APP_VERSION + packaging/app-config.json +
+      packaging/version_info.txt (minor bump: diagnostics now run
+      scans — a behaviour change, not a patch).
+- [x] Tests: **178 unit** (154 + 24 new TestDiagnosticSweep) /
+      **71 self-test** (63 + 8) / **42 packaging** — all green
+      locally. README corrected ("Scanning only reads" was no
+      longer true) + a "Diagnostic sweep" subsection added.
+- [ ] Release: CI build on windows-latest, GitHub release v1.3.0,
+      Drive Setup.exe updated in place — parent's ship step.
+- [ ] Real-Windows verification (owner's PC): a full diagnostic
+      whose report shows all three sweep legs with real Defender
+      timestamps; first-run full sweep duration; Malwarebytes
+      launch leg if installed there.
+
+Honest limits: as with every release of this app, real-Windows
+behaviour is UNVERIFIED until the owner's install. Scoped note:
+the GUI Preventative button and the troubleshooter security flow
+do not run the sweep (they never claimed to) — see the AUDITS
+addendum's scoped implementation note.

@@ -4,6 +4,7 @@ Everything here tests pure logic against recorded fixtures — the
 Windows-only command paths are never exercised on this machine and
 must present as honest 'needs Windows' states instead.
 """
+import datetime
 import hashlib
 import json
 import os
@@ -1858,6 +1859,291 @@ class TestScanHangRegression(unittest.TestCase):
         self.assertIn("def fix_progress(i, total, label)", src)
         self.assertIn("on_findings=stream", src)
         self.assertIn('state["scan_token"]', src)
+
+
+class TestDiagnosticSweep(unittest.TestCase):
+    """v1.3.0: the diagnostic security + error sweep. Pure logic and
+    store behaviour run anywhere; the Windows legs are exercised
+    with the Defender executor and platform flag mocked, so what is
+    tested is the sweep's own wiring — never a faked scan."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            self.tmp, ignore_errors=True))
+        self.path = os.path.join(self.tmp, "diagnostic-settings.json")
+        self.today = datetime.date(2026, 11, 2)
+
+    def _settings(self, **over):
+        s = wh.default_diagnostic_settings()
+        s.update(over)
+        return s
+
+    # --- the settings store -----------------------------------------
+    def test_settings_defaults_when_file_missing(self):
+        s = wh.load_diagnostic_settings(self.path)
+        self.assertEqual(s, wh.default_diagnostic_settings())
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_settings_round_trip(self):
+        s = self._settings(full_cadence="weekly", second_opinion="off")
+        wh.save_diagnostic_settings(s, self.path)
+        back = wh.load_diagnostic_settings(self.path)
+        self.assertEqual(back["full_cadence"], "weekly")
+        self.assertEqual(back["second_opinion"], "off")
+        self.assertEqual(back["defender_depth"], "quick")
+
+    def test_settings_salvage_keeps_valid_drops_invalid(self):
+        raw = {"defender_depth": "full",
+               "full_cadence": "daily",          # not a real cadence
+               "second_opinion": "off",
+               "custom_targets": ["C:\\Downloads", 42, ""],
+               "sweep_state": {"runs": 5, "last_full": "2026-10-01",
+                               "junk": True}}
+        cleaned = wh._salvage_diagnostic_settings(raw)
+        self.assertEqual(cleaned["defender_depth"], "full")
+        self.assertEqual(cleaned["full_cadence"], "monthly")
+        self.assertEqual(cleaned["second_opinion"], "off")
+        self.assertEqual(cleaned["custom_targets"], ["C:\\Downloads"])
+        self.assertEqual(cleaned["sweep_state"],
+                         {"runs": 5, "last_full": "2026-10-01"})
+        self.assertIsNone(wh._salvage_diagnostic_settings([1, 2]))
+
+    def test_settings_corrupt_file_rebuilds_defaults(self):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        s = wh.load_diagnostic_settings(self.path)
+        self.assertEqual(s, wh.default_diagnostic_settings())
+        quar = [n for n in os.listdir(self.tmp)
+                if n.startswith("diagnostic-settings.json.corrupt-")]
+        self.assertEqual(len(quar), 1)
+
+    def test_save_rejects_unknown_enum_values(self):
+        for bad in ({"defender_depth": "deep"},
+                    {"full_cadence": "daily"},
+                    {"second_opinion": "clamav"},
+                    {"auto_check_depth": "offline"},
+                    {"custom_targets": "C:\\Downloads"},
+                    {"sweep_state": {"runs": -1}}):
+            s = self._settings(**bad)
+            with self.assertRaises(ValueError, msg=str(bad)):
+                wh.save_diagnostic_settings(s, self.path)
+        with self.assertRaises(ValueError):
+            wh.save_diagnostic_settings(["not", "a", "dict"], self.path)
+
+    # --- decide_sweep_depth ------------------------------------------
+    def test_first_run_is_full(self):
+        depth, reason = wh.decide_sweep_depth(self._settings(),
+                                              today=self.today)
+        self.assertEqual(depth, "full")
+        self.assertIn("first", reason)
+
+    def test_full_default_stays_full(self):
+        s = self._settings(defender_depth="full")
+        s["sweep_state"] = {"runs": 9, "last_full": "2026-11-01"}
+        self.assertEqual(wh.decide_sweep_depth(s, today=self.today)[0],
+                         "full")
+
+    def test_custom_with_targets_scans_them(self):
+        s = self._settings(defender_depth="custom",
+                           custom_targets=["C:\\Downloads"])
+        s["sweep_state"] = {"runs": 9, "last_full": "2026-11-01"}
+        self.assertEqual(wh.decide_sweep_depth(s, today=self.today)[0],
+                         "custom")
+
+    def test_custom_without_targets_falls_back_to_quick(self):
+        s = self._settings(defender_depth="custom", custom_targets=[])
+        s["sweep_state"] = {"runs": 9, "last_full": "2026-11-01"}
+        depth, reason = wh.decide_sweep_depth(s, today=self.today)
+        self.assertEqual(depth, "quick")
+        self.assertIn("no folder", reason)
+
+    def test_weekly_rotation_boundary(self):
+        s = self._settings(full_cadence="weekly")
+        s["sweep_state"] = {"runs": 2, "last_full": "2026-10-27"}  # 6d
+        self.assertEqual(wh.decide_sweep_depth(s, today=self.today)[0],
+                         "quick")
+        s["sweep_state"] = {"runs": 2, "last_full": "2026-10-26"}  # 7d
+        self.assertEqual(wh.decide_sweep_depth(s, today=self.today)[0],
+                         "full")
+
+    def test_monthly_rotation_boundary(self):
+        s = self._settings(full_cadence="monthly")
+        s["sweep_state"] = {"runs": 2, "last_full": "2026-10-06"}  # 27d
+        self.assertEqual(wh.decide_sweep_depth(s, today=self.today)[0],
+                         "quick")
+        s["sweep_state"] = {"runs": 2, "last_full": "2026-10-05"}  # 28d
+        self.assertEqual(wh.decide_sweep_depth(s, today=self.today)[0],
+                         "full")
+
+    def test_cadence_never_and_missing_last_full(self):
+        s = self._settings(full_cadence="never")
+        s["sweep_state"] = {"runs": 2, "last_full": None}
+        self.assertEqual(wh.decide_sweep_depth(s, today=self.today)[0],
+                         "quick")
+        s = self._settings(full_cadence="monthly")
+        s["sweep_state"] = {"runs": 2, "last_full": None}
+        self.assertEqual(wh.decide_sweep_depth(s, today=self.today)[0],
+                         "full")
+
+    # --- sweep_summary ------------------------------------------------
+    def test_summary_complete(self):
+        title, sev = wh.sweep_summary(
+            {"state": "ran", "depth": "full"},
+            {"state": "launched", "detail": "launched"},
+            {"state": "ran"})
+        self.assertTrue(title.startswith("Diagnostic sweep: COMPLETE"))
+        self.assertIn("full", title)
+        self.assertEqual(sev, "info")
+
+    def test_summary_complete_with_opinion_off_by_setting(self):
+        # Off by the user's own setting is complete WITH disclosure.
+        title, sev = wh.sweep_summary(
+            {"state": "ran", "depth": "quick"},
+            {"state": "off", "detail": "off (your setting)"},
+            {"state": "ran"})
+        self.assertTrue(title.startswith("Diagnostic sweep: COMPLETE"))
+        self.assertEqual(sev, "info")
+
+    def test_summary_silent_leg_is_incomplete(self):
+        title, sev = wh.sweep_summary(
+            {"state": "ran", "depth": "quick"}, {}, {"state": "ran"})
+        self.assertTrue(title.startswith("Diagnostic sweep: "
+                                         "INCOMPLETE"))
+        self.assertIn("second-opinion", title)
+        self.assertEqual(sev, "warn")
+
+    def test_summary_defender_failure_is_incomplete(self):
+        title, sev = wh.sweep_summary(
+            {"state": "failed", "detail": "Defender says a scan is "
+                                          "already running"},
+            {"state": "absent"}, {"state": "ran"})
+        self.assertTrue(title.startswith("Diagnostic sweep: "
+                                         "INCOMPLETE"))
+        self.assertIn("already running", title)
+        self.assertEqual(sev, "warn")
+
+    def test_summary_sweep_off_for_auto_check(self):
+        title, sev = wh.sweep_summary(
+            {"state": "off"}, {"state": "off"}, {"state": "ran"})
+        self.assertTrue(title.startswith("Diagnostic sweep: "
+                                         "INCOMPLETE"))
+        self.assertIn("off in settings for auto-checks", title)
+
+    def test_summary_error_leg_excluded_is_incomplete(self):
+        title, sev = wh.sweep_summary(
+            {"state": "ran", "depth": "quick"},
+            {"state": "absent"},
+            {"state": "excluded",
+             "detail": "not part of this run"})
+        self.assertTrue(title.startswith("Diagnostic sweep: "
+                                         "INCOMPLETE"))
+        self.assertIn("not part of this run", title)
+
+    # --- the stage itself ----------------------------------------------
+    def test_scanners_end_with_sweep_and_category_exists(self):
+        self.assertEqual(wh.SCANNERS[-1][0], "sweep")
+        self.assertEqual(wh.CATEGORY_TITLES["sweep"],
+                         "Security + error sweep")
+
+    def test_scan_sweep_off_windows_is_honest(self):
+        if wh.IS_WINDOWS:
+            self.skipTest("off-Windows degradation only")
+        out = wh.scan_sweep(lambda msg: None)
+        self.assertIn("needs Windows", out[0].title)
+        self.assertTrue(out[-1].title.startswith(
+            "Diagnostic sweep: INCOMPLETE"))
+        self.assertIn("nothing was scanned", out[-1].title)
+
+    def _run_sweep_stage(self, defender_result, entries=None,
+                         ctx=None, settings=None):
+        """Run run_scan with only the error checks + the sweep stage,
+        the Defender executor and the platform flag mocked."""
+        saved = []
+
+        def fake_save(s, path=None):
+            saved.append(s)
+            return s
+        scanners = [("sysfiles", lambda log: []),
+                    ("events", lambda log: []),
+                    ("sweep", wh.scan_sweep)]
+        ctx = ctx or {"headless": False, "launch_second_opinion": True}
+        with mock.patch.object(wh, "SCANNERS", scanners), \
+                mock.patch.object(wh, "IS_WINDOWS", True), \
+                mock.patch.object(wh, "fix_defender_scan",
+                                  return_value=defender_result) as fds, \
+                mock.patch.object(wh, "load_diagnostic_settings",
+                                  return_value=settings
+                                  or wh.default_diagnostic_settings()), \
+                mock.patch.object(wh, "save_diagnostic_settings",
+                                  side_effect=fake_save), \
+                mock.patch.object(wh, "enum_uninstall_entries",
+                                  return_value=entries or []), \
+                mock.patch.object(wh.subprocess, "Popen") as popen:
+            findings = wh.run_scan(lambda msg: None, sweep_ctx=ctx)
+        return findings, saved, fds, popen
+
+    def test_sweep_leg_runs_defender_and_counts_the_run(self):
+        findings, saved, fds, _popen = self._run_sweep_stage(
+            (True, "quick scan finished — no new detections."))
+        # First-ever run must promote quick -> full (owner default).
+        payload = fds.call_args[0][0].payload
+        self.assertEqual(payload["scan_type"], "full")
+        titles = [f.title for f in findings]
+        self.assertTrue(any(t.startswith(
+            "Diagnostic sweep: Defender full scan ran")
+            for t in titles))
+        self.assertTrue(titles[-1].startswith(
+            "Diagnostic sweep: COMPLETE"))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["sweep_state"]["runs"], 1)
+        self.assertEqual(saved[0]["sweep_state"]["last_full"],
+                         datetime.date.today().isoformat())
+
+    def test_sweep_leg_already_running_is_incomplete_no_count(self):
+        findings, saved, _fds, _popen = self._run_sweep_stage(
+            (False, "Defender says a scan is already running — let "
+                    "that one finish rather than stacking another."))
+        titles = [f.title for f in findings]
+        self.assertTrue(titles[-1].startswith(
+            "Diagnostic sweep: INCOMPLETE"))
+        self.assertIn("already running", titles[-1])
+        self.assertEqual(saved, [])  # failed leg never counts a run
+
+    def test_sweep_second_opinion_launch_is_honest(self):
+        entry = {"name": "Malwarebytes version 5",
+                 "location": "C:\\Program Files\\Malwarebytes"}
+        settings = wh.default_diagnostic_settings()
+        settings["sweep_state"] = {"runs": 1,
+                                   "last_full":
+                                   datetime.date.today().isoformat()}
+        with mock.patch.object(wh, "find_malwarebytes_exe",
+                               return_value="C:\\mb\\mbam.exe"):
+            findings, _saved, _fds, popen = self._run_sweep_stage(
+                (True, "quick scan finished — no new detections."),
+                entries=[entry], settings=settings)
+        self.assertEqual(popen.call_count, 1)
+        opinion = [f for f in findings
+                   if f.title.startswith("Second opinion")]
+        self.assertEqual(len(opinion), 1)
+        self.assertIn("CANNOT read them", opinion[0].detail)
+        self.assertTrue(findings[-1].title.startswith(
+            "Diagnostic sweep: COMPLETE"))
+
+    def test_sweep_headless_skips_when_setting_off(self):
+        settings = wh.default_diagnostic_settings()
+        settings["auto_check_sweep"] = False
+        findings, _saved, fds, _popen = self._run_sweep_stage(
+            (True, "unused"),
+            ctx={"headless": True, "launch_second_opinion": False},
+            settings=settings)
+        self.assertEqual(fds.call_count, 0)
+        titles = [f.title for f in findings]
+        self.assertIn("Sweep leg skipped in auto-check (your "
+                      "setting)", titles)
+        self.assertTrue(titles[-1].startswith(
+            "Diagnostic sweep: INCOMPLETE"))
+        self.assertIn("off in settings for auto-checks", titles[-1])
 
 
 if __name__ == "__main__":

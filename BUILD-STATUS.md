@@ -327,14 +327,12 @@ Honest limits: not proven on real Windows — the owner's install
 (v1.1.1 → v1.2.1 via the in-app updater or the Drive setup file)
 remains the test.
 
-## v1.3.0 — diagnostic security + error sweep (2026-11-02) — NOT YET RELEASED
+## v1.3.0 — diagnostic security + error sweep (2026-11-02)
 
 Implements the owner's fleet rule (2026-11-02, "Make it so"): no
 diagnostic is complete without a real virus/malware scan plus the
 system-file/event-log error checks, in one plain-language result.
-Plan + audits: docs/AUDITS.md, 2026-11-02 addendum. Built locally;
-**release (CI + GitHub + Drive) is a separate ship step — nothing
-below claims a published v1.3.0.**
+Plan + audits: docs/AUDITS.md, 2026-11-02 addendum.
 
 - [x] New final scan stage "Security + error sweep" (scan_sweep,
       registered last in SCANNERS) covering both run_scan entry
@@ -374,8 +372,18 @@ below claims a published v1.3.0.**
       **71 self-test** (63 + 8) / **42 packaging** — all green
       locally. README corrected ("Scanning only reads" was no
       longer true) + a "Diagnostic sweep" subsection added.
-- [ ] Release: CI build on windows-latest, GitHub release v1.3.0,
-      Drive Setup.exe updated in place — parent's ship step.
+- [x] Release (2026-11-02): CI run **41591183071** SUCCESS on
+      windows-latest (its gate re-ran unit tests + self-test from
+      source, built and smoke-tested the exe). GitHub release
+      **v1.3.0** published: WindowsHealthRepair-Setup.exe
+      **14,131,218 B**, SHA-256
+      `1b85af75a9da68e775106b606050ac14c34de0ead3a2c927d814dd86e0f169cd`,
+      MD5 `26e0c6cd5c574ffa2a455ceb57cfd123` (downloaded and
+      hash-verified against GitHub's recorded digest). Drive file
+      `WindowsHealthRepair-Setup.exe` (ID
+      1dyC6B82FdFntVJVbQnFlXj3n9KoVtDe_) updated IN PLACE to the
+      same bytes (post-upload size + MD5 verified) — Shawn's link
+      unchanged.
 - [ ] Real-Windows verification (owner's PC): a full diagnostic
       whose report shows all three sweep legs with real Defender
       timestamps; first-run full sweep duration; Malwarebytes

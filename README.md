@@ -22,7 +22,9 @@ version of that app.
    installs just for your user account and puts a shortcut in the
    Start Menu (and on the Desktop, unless you untick it).
 4. Launch **Windows Health & Repair** and press **Scan this PC**.
-   Scanning only reads — nothing changes.
+   The scan changes nothing itself — but since v1.3.0 it does run a
+   real Defender malware scan as part of the diagnostic (see
+   "Diagnostic sweep" below), so the first scan can take a while.
 5. Tick the fixes you want and press **Fix checked items**.
    Fixes need administrator rights; the app offers **Relaunch as admin**.
 6. **Save report** writes the full before/after report next to the app,
@@ -165,6 +167,45 @@ their installer without written permission, and a bundled AV copy
 would go stale immediately anyway. Downloads come from them,
 current version, their terms.
 
+### Diagnostic sweep (new in v1.3.0)
+
+Every diagnostic — **Scan this PC** and the scheduled headless
+auto-check — now ends with a **Security + error sweep** section, and
+the diagnostic is only reported **COMPLETE** when all three legs
+actually reported:
+
+1. **A real Defender scan ran** — at the depth you chose. The very
+   first diagnostic runs a **full** scan; later runs are quick,
+   with a full sweep rotating back on your cadence (weekly /
+   monthly / never). The **Sweep depth** button overrides the depth
+   for one run (including a folder scan), and **Full sweep every**
+   sets the cadence. A scan is not a fix, so no restore point is
+   created for it — anything Defender does about a detection is
+   Defender's own policy, reported as Defender's. (The tick-to-run
+   Defender scans in the Security section above are unchanged and
+   still sit behind the restore-point gate, and the Offline Scan
+   is never a sweep depth — it restarts the PC, so it stays an
+   explicit choice.) If the Defender scan does not finish — say one
+   is already running — the sweep says so and the diagnostic reads
+   **INCOMPLETE**, never "clean".
+2. **The second-opinion state** — if Malwarebytes is installed, the
+   sweep launches it (never in the headless auto-check, which opens
+   nothing) and reports exactly that: its results live in
+   Malwarebytes itself and this app **cannot read them**, so that
+   leg is reported as launched, never as verified clean. Not
+   installed, or switched off with the **Second opinion** button,
+   is reported just as plainly.
+3. **The system-file + error-log checks ran** (the SFC/DISM and
+   Recent system errors sections of the same scan).
+
+Depth, cadence, second-opinion and auto-check participation are
+your choices, saved next to the app (`diagnostic-settings.json`)
+through the same self-repairing settings store as everything else
+— the shipped values are starting defaults, not locked policy. The
+scheduled auto-check runs the sweep at the depth you set for it
+(quick by default) unless you turn its sweep off, in which case its
+report says the check was status-only, per your setting.
+
 ## Troubleshooter (new in v1.1.0)
 
 Press **Troubleshoot a problem…** and pick what is wrong:
@@ -285,8 +326,11 @@ invented.
 - Driver installs additionally require the driver backup, same run.
 - Every step is written to a timestamped log in `logs/`, and fixed
   items are re-checked afterwards (before/after in the report).
-- Risky optional items (network reset, Store cache reset, Defender
-  Quick Scan) are **off by default** and clearly labelled.
+- Risky optional fix items (network reset, Store cache reset, the
+  tick-to-run Defender scans in the Security section) are **off by
+  default** and clearly labelled. The diagnostic sweep's Defender
+  scan is different: it is a scan, not a fix — it runs as part of
+  every diagnostic at the depth you set (see "Diagnostic sweep").
 
 ## What it deliberately does NOT do
 

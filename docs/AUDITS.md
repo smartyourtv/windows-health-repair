@@ -526,3 +526,141 @@ ever ran.
    and always clears the busy state.
 
 Not proven on real Windows — the owner's install remains the test.
+
+# Addendum — 2026-11-02: diagnostic security + error sweep (v1.3.0)
+
+Owner build order 2026-11-02 22:28 ("Make it so"), on the standing
+fleet rule of the same night: no diagnostic is complete without a
+virus/malware scan plus error checks, in one plain-language result.
+Approved plan: goals/windows-health-repair-app/hidden_files/
+v1.3.0-diagnostic-sweep-version-plan.md. Version is v1.3.0, not a
+patch bump: a diagnostic now RUNS scans (a behavior change), where
+"Scan this PC" was read-only before.
+
+## Change-impact audit (written BEFORE implementing)
+
+- *Blast radius:* run_scan (one optional parameter + a thread-local
+  sweep context; per-scanner behaviour, streaming, and log lines
+  unchanged), one new scanner stage appended LAST in SCANNERS, one
+  new category, one new JSON store, the GUI scan-start (three small
+  toggle buttons of the existing auto-check style; the v1.2.1
+  renamed/marshaled callbacks untouched), cmd_scan_only (passes the
+  headless context), version strings ×3. Fix executors, the
+  troubleshooter, the registry module, and driver code: untouched.
+- *Regression risk — the v1.2.1 path:* run_scan is the code that
+  froze in v1.1.1. The sweep joins as a stage, not a rewrite; the
+  change to run_scan is additive (context plumbing + recording
+  which categories completed), pinned by the existing
+  TestScanHangRegression suite plus new sweep-leg cases, including
+  a mocked already-running Defender. Defender calls keep the
+  existing 3600 s timeouts inside fix_defender_scan — no new
+  unbounded call is added anywhere.
+- *The restore-point-gate question, answered plainly:* the sweep's
+  Defender leg reuses fix_defender_scan OUTSIDE a fix plan, so no
+  restore point is created for it. That is deliberate and safe: a
+  scan changes nothing the gate protects (the gate exists so FIXES
+  can be undone); anything Defender does about a detection is
+  Defender's own policy, and the finding says whose decision it
+  was. Every repair remains behind the gate, ticked-only,
+  verified-after, logged — unchanged. The tick-to-run Defender
+  scans in the Security section keep their gate too.
+- *Data & compatibility:* diagnostic-settings.json is a new file;
+  old installs get defaults on first use and the self-repair path
+  rebuilds it if corrupt. No existing store changes shape.
+  Rollback = reinstall v1.2.1, which ignores the new file.
+- *Permissions/security:* no new permissions, no new network calls
+  (the Malwarebytes download stays a user-tapped official link),
+  no bundled engine (license), stdlib only, no secrets.
+- *Behaviour changes (announced at release):* diagnostics take
+  longer; the first v1.3.0 diagnostic runs a FULL Defender sweep
+  (owner's starting default); README's "Scanning only reads" line
+  corrected in the same release.
+
+## What shipped
+
+1. **Settings store** — diagnostic-settings.json via the existing
+   self-repairing load/save path (+ _salvage_diagnostic_settings):
+   defender_depth (quick/full/custom + saved targets), full_cadence
+   (weekly/monthly/never), second_opinion (malwarebytes/off),
+   auto_check_sweep + auto_check_depth, and sweep_state (runs,
+   last_full). save_diagnostic_settings validates enums like
+   save_auto_check_mode (ValueError on unknown values). All of it
+   is changeable — the shipped values are starting defaults per the
+   owner's options-reserved ruling (2026-11-02 22:21).
+2. **decide_sweep_depth (pure)** — custom-with-targets → custom;
+   full default → full; first-ever diagnostic → full; then full
+   rotates on cadence (weekly ≥ 7 d, monthly ≥ 28 d, missing
+   last_full counts as due); otherwise quick. GUI per-run override
+   wins over the decision.
+3. **scan_sweep (last scanner)** — three legs + a verdict:
+   *Defender leg* runs fix_defender_scan at the decided depth
+   (custom runs each saved/chosen folder in sequence); only a
+   completed leg increments sweep_state.runs (a failed first run
+   stays "first" and retries full); the finding states start time
+   and elapsed duration and the no-restore-point reasoning.
+   *Second-opinion leg* is launch-only by the owner's decision:
+   installed + GUI → Malwarebytes is launched and reported as
+   launched, with "this app CANNOT read its results — not verified
+   clean" wording; headless → reported installed-not-launched;
+   absent → reported not installed (the Security card keeps the
+   download button; the sweep finding adds no second one);
+   off → "off (your setting)". *Error leg* reads the completed-
+   categories list run_scan records: sysfiles + events finished →
+   ran; filtered out by only= → "not part of this run"; raised →
+   failed. *Verdict* (sweep_summary, pure): COMPLETE only when
+   every leg reported; a leg that produced no result at all makes
+   the diagnostic INCOMPLETE — never "clean" (HQ-approved rule).
+4. **GUI** — "Sweep depth: Auto→Quick→Full→Custom folder…" per-run
+   override (folder picker cancels back to the previous choice),
+   "Full sweep every: …" and "Second opinion: …" persisted toggle
+   buttons, all disabled while busy; do_scan passes the context to
+   run_scan. Headless auto-check passes headless/no-launch and, if
+   its sweep is off in settings, the sweep stage reports the run
+   as status-only per setting, INCOMPLETE-by-setting.
+5. **Scoped implementation note (honest boundary):** the sweep
+   covers the two run_scan entry points — "Scan this PC" and the
+   headless auto-check (whose report therefore includes the sweep
+   alongside the preventative summary). The GUI *Preventative scan*
+   button stays what it was — a light status check whose attention
+   items route into a diagnostic — and the troubleshooter's
+   security flow stays guided; neither silently claims the sweep
+   ran. Folding the sweep into those two flows is a possible
+   follow-up, not a silent omission.
+
+## Pre-build audit (after implementation, before build)
+
+- *Permissions:* every new call is one the app already made
+  (Start-MpScan/MpCmdRun via the existing executor, uninstall
+  enumeration, Popen of the located Malwarebytes exe). No admin
+  needed to scan; the admin gate for fixes is untouched.
+- *Null/error paths:* the Defender leg catches executor exceptions
+  into a failed leg; settings load never raises on a bad file
+  (self-repair path); a save failure after a completed leg is
+  logged, not fatal. Enumeration failure in the second-opinion
+  leg degrades to an empty list and a "not installed" line, which
+  could understate an installed copy on a broken enumeration;
+  accepted because the Security section's own Malwarebytes card
+  runs the same enumeration independently and shows the same
+  state — the two can never disagree silently in opposite
+  directions.
+- *Threading:* all sweep work runs on the scan worker thread via
+  run_scan; the new buttons only set state/save settings on the UI
+  thread; no Tk is touched from the worker; scan_progress /
+  fix_progress / stream / watchdog are unchanged in behaviour.
+- *Self-repair:* the new store is a fifth store on the one
+  repairing path — corrupt → .bak restore → salvage → quarantine
+  + rebuild, verified by re-read, logged as repair events.
+- *Versions:* APP_VERSION, app-config.json, version_info.txt all
+  1.3.0; validate_packaging re-checks.
+
+Tests: **178 unit** (154 + 24 new TestDiagnosticSweep: store
+defaults/salvage/validation, the decide matrix incl. 7 d/28 d
+boundaries, every sweep_summary branch, off-Windows degradation,
+and mocked-executor sweep runs — first-run-full promotion,
+already-running = incomplete + no run counted, launch honesty,
+headless-off) / **71 self-test** (63 + 8) / **42 packaging** —
+green locally. CI + release are the parent's ship step.
+
+Not proven on real Windows — the owner's install remains the test:
+the end-of-chain proof is a real diagnostic on his PC whose report
+shows all three legs with real Defender timestamps.
